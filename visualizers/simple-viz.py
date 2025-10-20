@@ -3,6 +3,7 @@ import scipy.io
 import matplotlib.pyplot as plt
 import os
 from pathlib import Path
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 class SimpleRadarVisualizer:
     def __init__(self, dataset_path, calib_path, scene_number):
@@ -96,20 +97,23 @@ class SimpleRadarVisualizer:
         image = plt.imread(image_file)
 
          # --- NEW FILTERING STEP ---
-        # Set a threshold for the velocity value (4th column, index 3)
+        # Set a threshold for the intensity value (4th column, index 3)
         # You will need to experiment to find a good value for your data.
-        velocity_threshold = 30.0  
+        intensity_threshold = 0.0  
 
         # Create a boolean mask of points that meet the threshold
-        confident_mask = all_radar_data[:, 3] >= velocity_threshold
+        confident_mask = all_radar_data[:, 3] >= intensity_threshold
         
         # Apply the mask to get only the confident points.
         # Note: We only pass the x, y, z columns to the next functions.
         radar_points = all_radar_data[confident_mask, :3]
+
+        # ADD negative height filter for "underground points"
+        #radar_points = radar_points[radar_points[:, 2] > -1.0]
+        #radar_points = radar_points[radar_points[:, 2] < 5.0]
         
         print(f"Original points: {len(all_radar_data)}, Confident points: {len(radar_points)}")
         # --- END OF NEW STEP ---
-
 
         pointcloud = transform_point_cloud(radar_points, [0, 0, -self.azimuth_offset],
                                                             [-self.x_offset / 100, -self.y_offset / 100,
@@ -127,95 +131,107 @@ class SimpleRadarVisualizer:
 
         uvs, point_depths, filtered_idx = project_pcl_to_image(pointcloud, transformation_matrix,
                                                                camera_projection_matrix, (1216, 1936))
-        visualize_projection_on_image(image, uvs, point_depths, filtered_idx)
 
-def create_bev_from_radar(points, x_range=(-20, 20), y_range=(0, 50), resolution=0.1):
+        visualize_radar_dual_view(
+            image, 
+            pointcloud,
+            uvs, 
+            point_depths, 
+            filtered_idx,
+            point_size=20,
+            bev_camera_fov_only=True
+        )
+
+def visualize_radar_dual_view(image, radar_points, uvs, point_depths, filtered_idx, 
+                               point_size=20, bev_camera_fov_only=True):
     """
-    Creates a Bird's-Eye View (BEV) image from a set of 3D points.
-
-    This function assumes the input points are in a coordinate system where:
-    - The X-axis represents lateral distance (left/right).
-    - The Y-axis represents longitudinal distance (forward/backward).
-    - The Z-axis represents height (this is ignored for the BEV).
-
+    Creates a dual visualization with BEV map and image projection side by side.
+    Following RaDelft coordinate conventions:
+    - X: longitudinal (forward/backward)
+    - Y: lateral (left/right)
+    - Z: height
+    
     Args:
-        points (np.ndarray): The (N, 3) or (N, 4) array of radar points.
-        x_range (tuple): The min and max lateral values (in meters) to include.
-        y_range (tuple): The min and max longitudinal values (in meters) to include.
-        resolution (float): The size of each pixel in meters (e.g., 0.1 m/pixel).
-
-    Returns:
-        np.ndarray: A grayscale BEV image where white pixels represent detected points.
+        image: The camera image (numpy array)
+        radar_points: The transformed radar points (N, 3) or (N, 4)
+        uvs: The (u, v) coordinates for ALL projected points
+        point_depths: The depth values for ALL projected points
+        filtered_idx: The indices of points within the image frame
+        point_size: Size of plotted points on image
+        bev_camera_fov_only: If True, only show radar points visible in camera FOV in BEV
     """
-    # 1. Filter points to be within the desired grid range
-    mask = np.where(
-        (points[:, 0] >= x_range[0]) & (points[:, 0] <= x_range[1]) &
-        (points[:, 1] >= y_range[0]) & (points[:, 1] <= y_range[1])
-    )
-    points = points[mask]
-
-    # 2. Calculate the size of the output BEV image in pixels
-    img_width = int((x_range[1] - x_range[0]) / resolution)
-    img_height = int((y_range[1] - y_range[0]) / resolution)
+    # Create figure with two subplots side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9))
     
-    # 3. Create a blank (black) image
-    bev_image = np.zeros((img_height, img_width), dtype=np.uint8)
-
-    # 4. Convert real-world coordinates to pixel coordinates
-    # For X (lateral, corresponds to image width/columns)
-    px = ((points[:, 0] - x_range[0]) / resolution).astype(np.int32)
-    
-    # For Y (longitudinal, corresponds to image height/rows)
-    # We flip the Y-axis so that the top of the image is "forward"
-    py = (img_height - 1 - (points[:, 1] - y_range[0]) / resolution).astype(np.int32)
-    
-    # 5. Draw the points on the BEV image
-    # Note: Image coordinates are typically (row, col), which corresponds to (py, px)
-    bev_image[py, px] = 255
-    
-    return bev_image
-
-        
-def visualize_projection_on_image(image, uvs, point_depths, filtered_idx, point_size=20):
-    """
-    Overlays radar points onto a camera image with a color-coded depth.
-
-    :param image: The camera image (as a NumPy array).
-    :param uvs: The (u, v) coordinates for ALL projected points.
-    :param point_depths: The depth values for ALL projected points.
-    :param filtered_idx: The indices of points that are within the image frame.
-    :param point_size: The size of the plotted points.
-    """
-    # 1. Filter the points and depths to only include those inside the image canvas
+    # === LEFT SUBPLOT: Image Projection ===
+    # Filter visible points
     visible_points = uvs[filtered_idx]
     visible_depths = point_depths[filtered_idx]
-
-    # 2. Create the plot
-    fig, ax = plt.subplots(figsize=(16, 9))
-    ax.imshow(image)
-
-    # 3. Create a scatter plot of the radar points
-    # The 'c' argument is used to color each point based on its depth.
-    # We use a colormap ('viridis' is a good choice) to map depths to colors.
-    scatter = ax.scatter(
+    
+    # Display image
+    ax1.imshow(image)
+    
+    # Scatter plot with depth-based coloring
+    scatter = ax1.scatter(
         visible_points[:, 0],  # u-coordinates (horizontal)
         visible_points[:, 1],  # v-coordinates (vertical)
         c=visible_depths,      # Color based on depth
-        cmap='viridis',        # Colormap for depth visualization
-        s=point_size,          # Size of each point
-        edgecolors='black',    # Add a border to points for better visibility
-        linewidths=0.5
+        cmap='viridis',
+        s=point_size,
+        edgecolors='black',
+        linewidths=0.5,
+        alpha=0.8
     )
-
-    # 4. Add a colorbar to serve as a legend for the depth
-    cbar = fig.colorbar(scatter, ax=ax, orientation='vertical', fraction=0.03, pad=0.04)
-    cbar.set_label('Depth (meters)', weight='bold')
-
-    # 5. Finalize and display the plot
-    ax.set_title('Radar Point Cloud Projection', fontsize=16)
-    ax.axis('off')  # Hide the axes for a cleaner look
+    
+    # Add colorbar
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.1)
+    cbar1 = plt.colorbar(scatter, cax=cax1)
+    cbar1.set_label('Depth (m)', fontsize=12, weight='bold')
+    
+    ax1.set_title('Radar Points Projected on Camera Image', fontsize=14, weight='bold')
+    ax1.axis('off')
+    
+    # === RIGHT SUBPLOT: BEV Map (Following RaDelft conventions) ===
+    # Filter to only camera FOV points if requested
+    if bev_camera_fov_only:
+        bev_points = radar_points[filtered_idx]
+        title_suffix = " (Camera FOV Only)"
+    else:
+        bev_points = radar_points
+        title_suffix = ""
+    
+    # Plot BEV: -Y on x-axis (lateral), X on y-axis (longitudinal)
+    # Colored by height (Z)
+    scatter_bev = ax2.scatter(
+        -bev_points[:, 1],  # -Y (lateral) on horizontal axis
+        bev_points[:, 0],   # X (longitudinal) on vertical axis
+        c=bev_points[:, 2], # Color by height (Z)
+        cmap='viridis',
+        s=5,
+        alpha=0.8
+    )
+    
+    # Set axis limits (matching RaDelft conventions)
+    ax2.set_xlim(-25, 25)  # Lateral range
+    ax2.set_ylim(0, 50)    # Longitudinal range (forward)
+    
+    # Add colorbar
+    divider2 = make_axes_locatable(ax2)
+    cax2 = divider2.append_axes("right", size="5%", pad=0.1)
+    cbar2 = plt.colorbar(scatter_bev, cax=cax2)
+    cbar2.set_label('Height (m)', fontsize=12, weight='bold')
+    
+    # Add grid and labels
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.set_xlabel('y [m]', fontsize=12, weight='bold')
+    ax2.set_ylabel('x [m]', fontsize=12, weight='bold')
+    ax2.set_title(f'Bird\'s Eye View (BEV){title_suffix}', fontsize=14, weight='bold')
+    ax2.set_aspect('equal')
+    
     plt.tight_layout()
     plt.show()
+        
 
 def transform_point_cloud(point_cloud, rotation_angles, translation):
     """
