@@ -3,6 +3,7 @@ import time
 import numpy as np
 from OpenGL.GL import *
 from OpenGL.GLU import *
+from PIL import Image
 
 from modules.world import World
 from modules.entities import Cube, Point
@@ -15,7 +16,8 @@ from modules.utils import (
     save_flow_map, 
     save_flow_histogram,
     build_velocity_map,
-    project_to_2d
+    project_to_2d,
+    save_grayscale_map
 )
 
 sys.path.append('..') # Add parent directory to path
@@ -40,28 +42,27 @@ if __name__ == "__main__":
     # Add a cube moving in the +X direction
     cube1 = Cube(
         position=[-5.0, 0.0, 0.0],
-        velocity=[2.0, 0.0, 0.0],
+        velocity=[2.0, 1.0, 0.0],
         texture_path = TEXTURE_FILE
     )
     cube1.id_color = [1.0 / 255.0, 0.0, 0.0] # ID Color 1
     world.add_entity(cube1)
 
     # Add a cube moving in the -Z direction
-    cube2 = Cube(
-        position=[3.0, 2.0, 2.0],
-        velocity=[0.0, 0.0, -1.5],
-        texture_path = TEXTURE_FILE
-    )
-    cube2.id_color = [2.0 / 255.0, 0.0, 0.0] # ID Color 2
-    world.add_entity(cube2)
+    # cube2 = Cube(
+    #     position=[3.0, 2.0, 2.0],
+    #     velocity=[0.0, 0.0, -1.0],
+    #     texture_path = TEXTURE_FILE
+    # )
+    # cube2.id_color = [2.0 / 255.0, 0.0, 0.0] # ID Color 2
+    # world.add_entity(cube2)
 
     id_to_velocity_map = {
         # (R, G, B) : [vx, vy, vz]
         (1, 0, 0): cube1.velocity,
-        (2, 0, 0): cube2.velocity,
+        # (2, 0, 0): cube2.velocity,
         (0, 0, 0): np.array([0.0, 0.0, 0.0]) # Background
     }
-
 
     # 2. Define viewports
     # Top-left (Camera)
@@ -151,6 +152,8 @@ if __name__ == "__main__":
             
             # A. Get Estimated Flow (from model)
             estimated_flow_map = optical_flow.inference(previous_image, current_image)
+
+            print(f"Saved GT flow, Estimated flow, and EPE map for frame {frame_count}")
             
             # B. Calculate Ground Truth Flow
             
@@ -174,6 +177,18 @@ if __name__ == "__main__":
             # C. Compare Estimated vs. Ground Truth
             error_map = ground_truth_flow_map - estimated_flow_map
             epe_map = np.linalg.norm(error_map, axis=2)
+
+            # --- SAVE DEBUG IMAGES ---
+            gt_flow_image = flow_to_image(ground_truth_flow_map)
+            estimated_flow_image = flow_to_image(estimated_flow_map)
+            # Save flow visualizations
+            Image.fromarray(gt_flow_image).save(f"gt_flow_vis_{frame_count}.png")
+            Image.fromarray(estimated_flow_image).save(f"est_flow_vis_{frame_count}.png")
+            # Save the EPE map (clipped for visibility)
+            save_grayscale_map(epe_map, f"epe_map_{frame_count}.png", vmax=50) # vmax=50 means errors > 50px appear white
+
+            print(f"Saved GT flow, Estimated flow, and EPE map for frame {frame_count}")
+            # -------------------------
             
             # Only calculate error on pixels that actually moved
             # 1. Find pixels that are *supposed* to be moving
@@ -191,8 +206,9 @@ if __name__ == "__main__":
 
             if np.any(moving_pixels_mask):
                 avg_epe = np.mean(epe_map[moving_pixels_mask])
+                median_epe = np.median(epe_map[moving_pixels_mask])
                 print(f"=============================================")
-                print(f"  MODEL ACCURACY (Average EPE): {avg_epe:.4f} pixels")
+                print(f"  MODEL ACCURACY (Average EPE): {avg_epe:.4f} pixels, Median EPE: {median_epe:.4f} pixels")
                 print(f"=============================================")
             else:
                 print("No moving pixels detected in ground truth.")

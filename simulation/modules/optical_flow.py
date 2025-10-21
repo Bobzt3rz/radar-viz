@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from scipy import interpolate
 import torch.nn.functional as F
+import cv2
 
 from .MemFlow.configs.sintel_memflownet import get_cfg
 from .MemFlow.core.Networks import build_network
@@ -154,3 +155,36 @@ class OpticalFlow:
         flow_map_numpy = flow_out.numpy().transpose(1, 2, 0)
 
         return flow_map_numpy
+    
+    def inference_cv(self, frame1_img: np.ndarray, frame2_img: np.ndarray) -> np.ndarray:
+        """
+        Calculates dense optical flow using cv2.calcOpticalFlowFarneback
+        in a self-contained, stateless way.
+        
+        Args:
+            frame1_img: The first image (previous) as a (H, W, 3) np.ndarray (uint8).
+            frame2_img: The second image (current) as a (H, W, 3) np.ndarray (uint8).
+            
+        Returns:
+            A (H, W, 2) np.ndarray representing the (u, v) flow field.
+        """
+        
+        # 1. Convert images to grayscale
+        prev_gray_img = cv2.cvtColor(frame1_img, cv2.COLOR_RGB2GRAY)
+        curr_gray_img = cv2.cvtColor(frame2_img, cv2.COLOR_RGB2GRAY)
+
+        # 2. Calculate dense optical flow
+        flow_map = cv2.calcOpticalFlowFarneback(
+            prev_gray_img,     # Previous grayscale frame
+            curr_gray_img,     # Current grayscale frame
+            None,              # 'flow': output flow map (we get it from return)
+            0.5,               # 'pyr_scale': 0.5 for a 2-level pyramid
+            3,                 # 'levels': number of pyramid levels
+            15,                # 'winsize': averaging window size
+            3,                 # 'iterations': iterations at each level
+            5,                 # 'poly_n': 5-pixel neighborhood for poly expansion
+            1.2,               # 'poly_sigma': std dev
+            0                  # 'flags': 
+        )
+
+        return flow_map

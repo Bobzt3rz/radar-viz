@@ -21,6 +21,13 @@ def build_velocity_map(id_map: np.ndarray, id_to_velocity: dict) -> np.ndarray:
 
     return velocity_map
 
+def save_grayscale_map(map_data: np.ndarray, filename: str, vmin=0, vmax=None):
+    """Saves a 2D NumPy array as a grayscale image."""
+    if vmax is None:
+        vmax = np.max(map_data)
+    plt.imsave(filename, map_data, cmap='gray', vmin=vmin, vmax=vmax)
+    print(f"Saved grayscale map to {filename}")
+
 def project_to_2d(world_points: np.ndarray, modelview: np.ndarray, projection: np.ndarray, viewport: Tuple[int, int, int, int]) -> np.ndarray:
     """
     Projects a (H, W, 3) map of 3D world points into
@@ -29,9 +36,35 @@ def project_to_2d(world_points: np.ndarray, modelview: np.ndarray, projection: n
     H, W, _ = world_points.shape
     pixel_coords = np.empty((H, W, 2), dtype=float)
 
+    # --- ADD DETAILED DEBUG ---
+    # Pick a pixel expected to be on cube1 early on (adjust coords if needed)
+    debug_v, debug_u = 66, 210 # Example: middle row, left quarter
+
+    # Get the predicted 3D world coordinate for this pixel
+    debug_world_pt = world_points[debug_v, debug_u]
+
+    # Only print if it's not background
+    if np.any(debug_world_pt != 0):
+        # Project only this point
+        u_gl, v_gl, _ = gluProject(debug_world_pt[0], debug_world_pt[1], debug_world_pt[2],
+                                   modelview, projection, viewport)
+        v_numpy = (H - 1) - v_gl
+
+        print(f"\n--- DEBUG project_to_2d (Pixel v={debug_v}, u={debug_u}) ---")
+        print(f"  Input World Pos (Predicted): {debug_world_pt}")
+        print(f"  Output Pixel Pos (Projected): [{u_gl:.2f}, {v_numpy:.2f}] (NumPy coords)")
+        # Calculate expected starting pixel (roughly, might be slightly off due to perspective)
+        print(f"  Expected Starting Pixel:      [{debug_u}, {debug_v}]")
+        # Calculate the ground truth flow vector *for this pixel only*
+        gt_flow_debug = np.array([u_gl, v_numpy]) - np.array([debug_u, debug_v])
+        print(f"  => Calculated GT Flow Vector: {gt_flow_debug}")
+        print(f"---------------------------------------------------\n")
+    # --- END DEBUG ---
+
     for v_idx in range(H):
         for u_idx in range(W):
             wx, wy, wz = world_points[v_idx, u_idx]
+
             # Handle background (0,0,0) points
             if wx == 0 and wy == 0 and wz == 0:
                 pixel_coords[v_idx, u_idx] = [u_idx, v_idx] # No motion
@@ -42,7 +75,7 @@ def project_to_2d(world_points: np.ndarray, modelview: np.ndarray, projection: n
             # Flip the 'v' coordinate from OpenGL (bottom-left)
             # to NumPy (top-left)
             v_numpy = (H - 1) - v_gl
-      
+
             pixel_coords[v_idx, u_idx] = [u_gl, v_numpy]
             
     return pixel_coords
@@ -207,6 +240,7 @@ def flow_to_image(flow_uv, clip_flow=None, convert_to_bgr=False):
         flow_uv = np.clip(flow_uv, 0, clip_flow)
     u = flow_uv[:,:,0]
     v = flow_uv[:,:,1]
+
     rad = np.sqrt(np.square(u) + np.square(v))
     rad_max = np.max(rad)
     # rad_max = 3.0  # Set a fixed max flow of 10 pixels. Tune this value!
