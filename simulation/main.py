@@ -1,8 +1,9 @@
-import time
 from modules.world import World
 from modules.entities import Cube, Point
 from modules.gl_renderer import OpenGLRenderer
 from modules.ego_sensor_rig import EgoSensorRig
+from modules.utils import save_as_ply
+from modules.optical_flow import OpticalFlow
 
 import sys
 
@@ -16,8 +17,11 @@ if __name__ == "__main__":
 
     # Radar world
     radar_world = World()
-
     rig = EgoSensorRig()
+
+    # Camera
+    optical_flow = OpticalFlow()
+    optical_flow.inference()
     
     # Add a cube moving in the +X direction
     cube1 = Cube(position=[-5.0, 0.0, 0.0], velocity=[2.0, 0.0, 0.0])
@@ -38,6 +42,9 @@ if __name__ == "__main__":
 
     # 3. Main Loop
     dt = 0.016 # Aim for ~60 FPS
+    saved_frame = False
+    frame_count = 0
+
     while not renderer.should_close():
         # Update the simulation state
         world.update(dt)
@@ -51,6 +58,11 @@ if __name__ == "__main__":
         for point_3d in radar_points:
             radar_world.add_entity(Point(position=point_3d, color=[0.0, 1.0, 0.0]))
         
+        # --- 6. Save on first frame ---
+        if frame_count % 100 == 0 and radar_points.size > 0:
+            save_as_ply(radar_points, str(frame_count) + ".ply")
+            saved_frame = True
+        
         # Render the current world state
         renderer.begin_frame()
     
@@ -60,5 +72,7 @@ if __name__ == "__main__":
         renderer.render_view(radar_world, rig.get_radar(), viewport_right)
         
         renderer.end_frame()
+
+        frame_count += 1
 
     renderer.shutdown()

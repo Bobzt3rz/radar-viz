@@ -83,10 +83,7 @@ class OpenGLRenderer:
 
         # 4. --- Draw all entities from the world ---
         for entity in world.entities:
-            if isinstance(entity, Cube):
-                self._draw_cube(entity)
-            elif isinstance(entity, Point):
-                self._draw_point(entity)
+            entity.draw()
 
     def end_frame(self):
         """
@@ -94,33 +91,6 @@ class OpenGLRenderer:
         the buffers and display the result.
         """
         glfw.swap_buffers(self.window)
-
-    def _draw_cube(self, cube_entity: Cube):
-        """Draws a single cube entity. (Unchanged)"""
-        glPushMatrix() 
-        pos = cube_entity.position
-        glTranslatef(pos[0], pos[1], pos[2])
-        
-        glColor3fv(cube_entity.color)
-        glBegin(GL_QUADS)
-        for face in cube_entity.FACES:
-            for vertex_index in face:
-                glVertex3fv(cube_entity.VERTICES[vertex_index])
-        glEnd()
-        
-        glPopMatrix()
-    
-    def _draw_point(self, point_entity: Point):
-        """Draws a single point entity."""
-        
-        # Set point size (how many pixels big)
-        glPointSize(5.0)
-        
-        # Draw the single vertex
-        glColor3fv(point_entity.color)
-        glBegin(GL_POINTS)
-        glVertex3fv(point_entity.position)
-        glEnd()
 
     def shutdown(self):
         """Terminates GLFW. (Unchanged)"""
