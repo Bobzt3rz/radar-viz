@@ -25,6 +25,8 @@ sys.path.append('..') # Add parent directory to path
 WINDOW_WIDTH, WINDOW_HEIGHT = 640, 360
 TEXTURE_FILE = "/home/bobberman/programming/radar/radar-viz/simulation/assets/checkerboard.png"
 
+EGO_VELOCITY = np.array([0.0, 0.0, 1.0], dtype=float)
+
 if __name__ == "__main__":
     # 1. Simulation Setup
     world = World()
@@ -49,18 +51,18 @@ if __name__ == "__main__":
     world.add_entity(cube1)
 
     # Add a cube moving in the -Z direction
-    # cube2 = Cube(
-    #     position=[3.0, 2.0, 2.0],
-    #     velocity=[0.0, 0.0, -1.0],
-    #     texture_path = TEXTURE_FILE
-    # )
-    # cube2.id_color = [2.0 / 255.0, 0.0, 0.0] # ID Color 2
-    # world.add_entity(cube2)
+    cube2 = Cube(
+        position=[3.0, 2.0, 2.0],
+        velocity=[0.0, 0.0, -1.0],
+        texture_path = TEXTURE_FILE
+    )
+    cube2.id_color = [2.0 / 255.0, 0.0, 0.0] # ID Color 2
+    world.add_entity(cube2)
 
     id_to_velocity_map = {
         # (R, G, B) : [vx, vy, vz]
         (1, 0, 0): cube1.velocity,
-        # (2, 0, 0): cube2.velocity,
+        (2, 0, 0): cube2.velocity,
         (0, 0, 0): np.array([0.0, 0.0, 0.0]) # Background
     }
 
@@ -86,15 +88,13 @@ if __name__ == "__main__":
     previous_image = None
     previous_world_pos_map = None
     previous_id_map = None
-    previous_modelview = None
-    previous_projection = None
-    previous_viewport = None
 
     flow_image = None
     
     while not renderer.should_close():
         # Update the simulation state
         world.update(dt)
+        rig.update(dt, EGO_VELOCITY)
 
         radar_points = rig.get_radar().simulate_scan(world)
 
@@ -144,9 +144,6 @@ if __name__ == "__main__":
         if previous_image is not None and \
             previous_id_map is not None and \
             previous_world_pos_map is not None and  \
-            previous_projection is not None and \
-            previous_modelview is not None and \
-            previous_viewport is not None and \
             frame_count % 20 == 0:
             print(f"\n--- Running inference & validation on frame {frame_count} ---")
             
@@ -166,11 +163,11 @@ if __name__ == "__main__":
             # --- USE THE STORED MATRICES ---
             pixel_pos_map_curr_gt = project_to_2d(
                 world_pos_map_curr_gt, 
-                previous_modelview, 
-                previous_projection, 
-                previous_viewport
+                current_modelview, 
+                current_projection, 
+                current_viewport
             )
-            
+
             # B4. Calculate the flow vector
             ground_truth_flow_map = pixel_pos_map_curr_gt - pixel_pos_map_prev
             
@@ -224,10 +221,7 @@ if __name__ == "__main__":
         previous_image = current_image
         previous_world_pos_map = current_world_pos_map
         previous_id_map = current_id_map
-        previous_modelview = current_modelview
-        previous_projection = current_projection
-        previous_viewport = current_viewport
         
         frame_count += 1
 
-    renderer.shutdown()#
+    renderer.shutdown()

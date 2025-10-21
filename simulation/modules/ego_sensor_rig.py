@@ -1,4 +1,5 @@
-# sensor_rig.py
+import numpy as np
+
 from .camera import Camera
 from .radar import Radar
 
@@ -9,18 +10,22 @@ class EgoSensorRig:
     static relationship to each other.
     """
     def __init__(self):
-        # Create a camera, positioned relative to the rig's origin.
-        # For simplicity, we'll start with the camera you had.
+        # 1. Store the rig's own pose, todo, make so radar is not in same position
+        self.position = np.array([0, 5, -10], dtype=float)
+        self.target = np.array([0, 0, 0], dtype=float)
+        self.up = np.array([0, 1, 0], dtype=float)
+
+        # 2. Create sensors using this pose
         self.camera = Camera(
-            position=[0, 5, -10],
-            target=[0, 0, 0],
-            up=[0, 1, 0]
+            position=self.position,
+            target=self.target,
+            up=self.up
         )
         
         self.radar = Radar(
-            position=[0, 5, -10],
-            target=[0, 0, 0],
-            up=[0, 1, 0]
+            position=self.position,
+            target=self.target,
+            up=self.up
         )
 
     def get_camera(self) -> Camera:
@@ -31,17 +36,27 @@ class EgoSensorRig:
         """Returns the radar for rendering."""
         return self.radar
 
-    def update_rig_pose(self, new_position, new_target, new_up):
+    def update(self, dt: float, translation_velocity: np.ndarray):
         """
-        This method would be called by your simulation to move the
-        entire rig. It updates the state of all sensors.
+        Updates the entire rig's pose based on velocity.
+        
+        :param dt: Time step.
+        :param translation_velocity: A (3,) np.array for [vx, vy, vz].
         """
-        # In a real system, you'd apply a transformation matrix.
-        # For this example, we just set the camera's pose directly.
-        self.camera.position = new_position
-        self.camera.target = new_target
-        self.camera.up = new_up
+        # --- 1. Calculate Translational Change ---
+        displacement = translation_velocity * dt
+        
+        # --- 2. Apply Change to Rig's Pose ---
+        # For translation, both position and target move together.
+        self.position += displacement
+        self.target += displacement
+        
+        # --- 3. Propagate Pose to Sensors ---
+        # This updates the state for the *next* render.
+        self.camera.position = self.position
+        self.camera.target = self.target
+        self.camera.up = self.up # (Stays the same for translation)
 
-        self.radar.position = new_position
-        self.radar.target = new_target
-        self.radar.up = new_up
+        self.radar.position = self.position
+        self.radar.target = self.target
+        self.radar.up = self.up

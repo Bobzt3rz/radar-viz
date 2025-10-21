@@ -1,2 +1,15 @@
 data/*
 outputs/*
+*.ply
+*.npy
+*.png
+simulation/assets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# TODO: the repo for memflow, should change to be submodules
+simulation/modules/MemFlow/

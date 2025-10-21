@@ -11,7 +11,7 @@ class Camera:
     Represents a camera with its pose (extrinsics) and
     properties (intrinsics) for rendering.
     """
-    def __init__(self, position: list, target: list, up: list):
+    def __init__(self, position: np.ndarray, target: np.ndarray, up: np.ndarray):
         # Extrinsics (Pose)
         self.position = np.array(position, dtype=float)
         self.target = np.array(target, dtype=float)
@@ -77,7 +77,15 @@ class Camera:
         )
         depth_buffer = np.frombuffer(
             depth_buffer_bytes, dtype='float32'  # type: ignore
-        ).reshape(height, width)
+        ).reshape(height, width)[::-1, :]
+
+        # ^-- WHY THE FLIP? [::-1, :]
+        # glReadPixels has its (0,0) origin at the BOTTOM-LEFT corner
+        # of the viewport.
+        # NumPy/PIL/OpenCV expect (0,0) at the TOP-LEFT.
+        # This flip makes the depth buffer's coordinate system
+        # consistent with get_id_map(), which is crucial for
+        # calculations in main.py.
         
         # --- 5. Restore Renderer's OpenGL State ---
         glViewport(original_viewport[0], original_viewport[1], original_viewport[2], original_viewport[3])
@@ -180,7 +188,7 @@ class Camera:
         for v_idx in range(height):
             for u_idx in range(width):
                 depth = depth_buffer[v_idx, u_idx]
-                
+
                 # Get the (u,v) from the grid (top-left)
                 u = u_grid[v_idx, u_idx]
                 v = v_grid[v_idx, u_idx]

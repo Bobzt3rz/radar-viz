@@ -14,7 +14,7 @@ class Radar(Camera):
     2D grid and performs a depth test to find the closest
     hit for each "pixel," thus simulating occlusion.
     """
-    def __init__(self, position: list, target: list, up: list, 
+    def __init__(self, position: np.ndarray, target: np.ndarray, up: np.ndarray, 
                  resolution: Tuple[int, int] = (128, 128)):
         
         # 1. Call the Camera's __init__
