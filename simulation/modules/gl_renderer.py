@@ -3,6 +3,7 @@ from OpenGL.GL import *
 from OpenGL.GLU import *
 import sys
 from typing import Tuple
+import numpy as np
 
 # Import the classes it needs to interact with
 from .world import World
@@ -84,6 +85,60 @@ class OpenGLRenderer:
         # 4. --- Draw all entities from the world ---
         for entity in world.entities:
             entity.draw()
+    
+    def read_viewport_pixels(self, viewport: Tuple[int, int, int, int]) -> np.ndarray:
+        """
+        Reads the pixels from the specified viewport directly from the
+        front buffer (after a render) and returns them as a NumPy array.
+        
+        :param viewport: A tuple (x, y, width, height) to read from.
+        :return: A (height, width, 3) NumPy array of RGB pixels.
+        """
+        x, y, width, height = viewport
+        
+        # Set the pixel alignment
+        glPixelStorei(GL_PACK_ALIGNMENT, 1)
+        
+        # Read the pixel data
+        data = glReadPixels(x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE)
+        
+        # Convert bytes to a numpy array
+        image = np.frombuffer(
+            data, dtype=np.uint8 # type: ignore
+        )
+        
+        # Reshape to (height, width, 3)
+        # Note: OpenGL's origin (0,0) is the bottom-left, so we need
+        # to flip the image vertically (using [::-1]) to get the
+        # standard top-left origin for images.
+        image = image.reshape((height, width, 3))[::-1, :, :]
+        
+        return image
+    
+    def draw_image_in_viewport(self, image_data: np.ndarray, viewport: Tuple[int, int, int, int]):
+        """
+        Draws a NumPy (H, W, 3) RGB image into a specific viewport.
+        
+        :param image_data: The (H, W, 3) np.uint8 array.
+        :param viewport: A tuple (x, y, width, height) to draw into.
+        """
+        x, y, width, height = viewport
+        H, W, _ = image_data.shape
+        
+        # 1. Set the viewport
+        glViewport(x, y, width, height)
+        
+        # 2. Set the raster position (where to start drawing)
+        # We'll just draw at the bottom-left corner (0,0) of the viewport
+        glWindowPos2i(x, y) 
+        
+        # 3. Set pixel alignment (good practice for NumPy)
+        glPixelStorei(GL_PACK_ALIGNMENT, 1)
+        
+        # 4. Draw the pixels from the NumPy array
+        # We must flip the image vertically (image_data[::-1, ...])
+        # because OpenGL's (0,0) is bottom-left.
+        glDrawPixels(W, H, GL_RGB, GL_UNSIGNED_BYTE, image_data[::-1, ...].tobytes())
 
     def end_frame(self):
         """

@@ -12,13 +12,13 @@ class EgoSensorRig:
         # Create a camera, positioned relative to the rig's origin.
         # For simplicity, we'll start with the camera you had.
         self.camera = Camera(
-            position=[0, 5, -20],
+            position=[0, 5, -10],
             target=[0, 0, 0],
             up=[0, 1, 0]
         )
         
         self.radar = Radar(
-            position=[0, 5, -20],
+            position=[0, 5, -10],
             target=[0, 0, 0],
             up=[0, 1, 0]
         )

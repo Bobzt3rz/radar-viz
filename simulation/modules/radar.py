@@ -33,72 +33,20 @@ class Radar(Camera):
         self.resolution_w = resolution[0]
         self.resolution_h = resolution[1]
 
-    # ... all other methods (_apply_view_matrix, _apply_projection_matrix)
-    # are INHERITED from Camera, so you can delete them if they are identical.
-    
     def simulate_scan(self, world: World) -> np.ndarray:
         """
-        Renders the world from the radar's perspective to the
-        hardware depth buffer, then reads it back and un-projects
-        it to a 3D point cloud.
+        Generates a 3D point cloud by un-projecting
+        the depth buffer.
         """
+        # 1. Call the base class method
+        world_pos_map = self.get_world_position_map(
+            world, self.resolution_w, self.resolution_h
+        )[0]
         
-        # --- 1. Save Renderer's OpenGL State ---
-        glMatrixMode(GL_PROJECTION)
-        glPushMatrix()
-        glMatrixMode(GL_MODELVIEW)
-        glPushMatrix()
+        # 2. Filter out non-hits (which we set to 0,0,0)
+        # Reshape to (N, 3)
+        hits = world_pos_map.reshape(-1, 3)
+        # Filter points where all coords are 0
+        hits = hits[np.any(hits != 0, axis=1)] 
         
-        original_viewport = glGetIntegerv(GL_VIEWPORT)
-
-        # --- 2. Setup Radar's "View" ---
-        radar_viewport = (0, 0, self.resolution_w, self.resolution_h)
-        glViewport(radar_viewport[0], radar_viewport[1], radar_viewport[2], radar_viewport[3])
-        
-        self.apply_projection_matrix(self.resolution_w / self.resolution_h)
-        self.apply_view_matrix()
-
-        # --- 3. Render Solid Faces to Hardware Depth Buffer ---
-        glClear(GL_DEPTH_BUFFER_BIT) 
-        for entity in world.entities:
-            if isinstance(entity, Cube):
-                entity.draw()
-
-        # --- 4. Read the Hardware Depth Buffer ---
-        depth_buffer_bytes = glReadPixels(
-            0, 0, self.resolution_w, self.resolution_h,
-            GL_DEPTH_COMPONENT, GL_FLOAT
-        )
-        
-        # --- THIS IS THE FIX ---
-        # Convert bytes to a numpy array of GL_FLOATs (np.float32)
-        # and then reshape it to the 2D grid
-        depth_buffer = np.frombuffer(
-            depth_buffer_bytes, dtype='float32'  # type: ignore
-        ).reshape(self.resolution_h, self.resolution_w)
-        # ---------------------
-
-        # --- 5. Un-project Depth Image to 3D Point Cloud ---
-        modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
-        projection = glGetDoublev(GL_PROJECTION_MATRIX)
-        
-        hits = []
-        for u in range(self.resolution_w):
-            for v in range(self.resolution_h):
-                depth = depth_buffer[v, u]
-                
-                if depth < 1.0:
-                    world_x, world_y, world_z = gluUnProject(
-                        u, v, depth,
-                        modelview, projection, radar_viewport
-                    )
-                    hits.append([world_x, world_y, world_z])
-
-        # --- 6. Restore Renderer's OpenGL State ---
-        glViewport(original_viewport[0], original_viewport[1], original_viewport[2], original_viewport[3])
-        glMatrixMode(GL_PROJECTION)
-        glPopMatrix()
-        glMatrixMode(GL_MODELVIEW)
-        glPopMatrix()
-
         return np.array(hits, dtype=float)

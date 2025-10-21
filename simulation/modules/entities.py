@@ -1,6 +1,7 @@
 import numpy as np
-from typing import List, Union
+from typing import List, Union, Optional
 from OpenGL.GL import *
+from PIL import Image
 
 class Entity:
     """
@@ -48,28 +49,101 @@ class Cube(Entity):
         (4, 5, 1, 0), (5, 4, 7, 6), (0, 1, 2, 3),
     )
 
-    def __init__(self, position: List[float], velocity: List[float]):
+    # These map the 4 corners of a texture to the 4 vertices of a quad
+    TEX_COORDS = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+    ], dtype=np.float32)
+
+    def __init__(self, position: List[float], velocity: List[float], texture_path: Optional[str] = None):
         # Call the parent class (Entity) constructor
         super().__init__(position=position, velocity=velocity)
-        # You could add cube-specific properties here, like color or size
-        self.color = [0.5, 0.5, 0.5]
+        # Set to white so texture isn't tinted
+        self.color = [1.0, 1.0, 1.0]
+        # A unique color to identify this object in a render
+        self.id_color = [0.0, 0.0, 0.0]
+
+        if texture_path:
+            self.tex_id = self._load_texture(texture_path)
+        else:
+            self.tex_id = None
+
+    def _load_texture(self, texture_path: str) -> int:
+        """Loads a texture from a file and returns its OpenGL ID."""
+        try:
+            img = Image.open(texture_path)
+            img.load()
+            img_data = np.array(list(
+                img.getdata() # type: ignore
+            ), np.uint8)
+            
+            tex_id = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, tex_id)
+            
+            # Set texture parameters
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            
+            # Upload the texture data
+            if img.mode == "RGB":
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
+            elif img.mode == "RGBA":
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+            else:
+                print(f"Warning: Texture '{texture_path}' is not RGB/RGBA. Skipping.")
+                return -1
+                
+            print(f"Loaded texture: {texture_path}")
+            return tex_id
+            
+        except Exception as e:
+            print(f"Error loading texture {texture_path}: {e}")
+            return -1 # Return an invalid ID
 
     def draw(self):
-        """ Draws the cube at its position. """
-        glPushMatrix() # Save the current matrix state
-        
-        # Apply the entity's position
+        """ Draws the cube at its position with texture. """
+        glPushMatrix()
         glTranslatef(self.position[0], self.position[1], self.position[2])
         
-        # Draw the geometry
-        glColor3fv(self.color)
+        if self.tex_id is not None and self.tex_id != -1:
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, self.tex_id)
+            glColor3fv(self.color) # Use white to show full texture color
+        else:
+            # Fallback for no texture
+            glColor3fv([0.5, 0.5, 0.5]) # Default gray
+
+        glBegin(GL_QUADS)
+        for i_face, face in enumerate(self.FACES):
+            for i_vertex, vertex_index in enumerate(face):
+                if self.tex_id:
+                    # Apply texture coordinate *before* vertex
+                    glTexCoord2fv(self.TEX_COORDS[i_vertex])
+                glVertex3fv(self.VERTICES[vertex_index])
+        glEnd()
+        
+        if self.tex_id is not None and self.tex_id != -1:
+            glDisable(GL_TEXTURE_2D)
+            
+        glPopMatrix()
+
+    def draw_for_id(self):
+        """ Draws the cube at its position with its unique ID color. """
+        glPushMatrix()
+        glTranslatef(self.position[0], self.position[1], self.position[2])
+        
+        glColor3fv(self.id_color) # <-- Uses ID color
         glBegin(GL_QUADS)
         for face in self.FACES:
             for vertex_index in face:
                 glVertex3fv(self.VERTICES[vertex_index])
         glEnd()
-        
-        glPopMatrix() # Restore the matrix state
+
+        glPopMatrix()
 
 class Point(Entity):
     """
