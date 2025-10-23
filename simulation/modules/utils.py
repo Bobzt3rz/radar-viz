@@ -32,51 +32,60 @@ def project_to_2d(world_points: np.ndarray, modelview: np.ndarray, projection: n
     """
     Projects a (H, W, 3) map of 3D world points into
     a (H, W, 2) map of 2D pixel coordinates.
+    
+    This is a vectorized version of the original loop-based function.
     """
     H, W, _ = world_points.shape
-    pixel_coords = np.empty((H, W, 2), dtype=float)
+    v_x, v_y, v_w, v_h = viewport
 
-    # --- ADD DETAILED DEBUG ---
-    # Pick a pixel expected to be on cube1 early on (adjust coords if needed)
-    debug_v, debug_u = 66, 210 # Example: middle row, left quarter
+    # --- 1. Identify Background Points ---
+    # Create a (H, W) boolean mask for background points
+    background_mask = np.all(world_points == 0.0, axis=-1)
 
-    # Get the predicted 3D world coordinate for this pixel
-    debug_world_pt = world_points[debug_v, debug_u]
+    # --- 2. Convert World to Homogeneous Coordinates ---
+    # Add a 'w' component of 1.0 to all world points
+    ones = np.ones((H, W, 1), dtype=float)
+    world_points_homogeneous = np.concatenate([world_points, ones], axis=-1) # (H, W, 4)
 
-    # Only print if it's not background
-    if np.any(debug_world_pt != 0):
-        # Project only this point
-        u_gl, v_gl, _ = gluProject(debug_world_pt[0], debug_world_pt[1], debug_world_pt[2],
-                                   modelview, projection, viewport)
-        v_numpy = (H - 1) - v_gl
+    # --- 3. Apply MVP Matrix (World -> Clip Space) ---
+    # The (4,4) matrices from glGetDoublev, when reshaped by NumPy,
+    # are already row-major. No .T is needed.
+    # P_clip_row = P_world_row @ M_modelview_row @ M_projection_row
+    clip_coords_homogeneous = world_points_homogeneous @ modelview @ projection
+    
+    # --- 4. Perspective Divide (Clip -> NDC) ---
+    # Get the 'w' component (H, W, 1)
+    w = clip_coords_homogeneous[..., 3, np.newaxis]
+    
+    # Avoid division by zero
+    # (Set w to 1.0 for background, or any point where w is 0)
+    w[w == 0] = 1.0 
+    
+    # (H, W, 3)
+    ndc_coords = clip_coords_homogeneous[..., :3] / w
 
-        print(f"\n--- DEBUG project_to_2d (Pixel v={debug_v}, u={debug_u}) ---")
-        print(f"  Input World Pos (Predicted): {debug_world_pt}")
-        print(f"  Output Pixel Pos (Projected): [{u_gl:.2f}, {v_numpy:.2f}] (NumPy coords)")
-        # Calculate expected starting pixel (roughly, might be slightly off due to perspective)
-        print(f"  Expected Starting Pixel:      [{debug_u}, {debug_v}]")
-        # Calculate the ground truth flow vector *for this pixel only*
-        gt_flow_debug = np.array([u_gl, v_numpy]) - np.array([debug_u, debug_v])
-        print(f"  => Calculated GT Flow Vector: {gt_flow_debug}")
-        print(f"---------------------------------------------------\n")
-    # --- END DEBUG ---
+    # --- 5. Map from NDC to Viewport (Pixel) Coordinates ---
+    # This is the standard gluProject viewport transformation
+    u_gl = (ndc_coords[..., 0] + 1.0) * 0.5 * v_w + v_x
+    v_gl = (ndc_coords[..., 1] + 1.0) * 0.5 * v_h + v_y
+    
+    # --- 6. Flip 'v' Coordinate (as in original) ---
+    # Flip the 'v' coordinate from OpenGL (bottom-left) to NumPy (top-left)
+    v_numpy = (H - 1) - v_gl
 
-    for v_idx in range(H):
-        for u_idx in range(W):
-            wx, wy, wz = world_points[v_idx, u_idx]
-
-            # Handle background (0,0,0) points
-            if wx == 0 and wy == 0 and wz == 0:
-                pixel_coords[v_idx, u_idx] = [u_idx, v_idx] # No motion
-                continue
-                
-            u_gl, v_gl, _ = gluProject(wx, wy, wz, modelview, projection, viewport)
-            
-            # Flip the 'v' coordinate from OpenGL (bottom-left)
-            # to NumPy (top-left)
-            v_numpy = (H - 1) - v_gl
-
-            pixel_coords[v_idx, u_idx] = [u_gl, v_numpy]
+    # --- 7. Combine Coordinates ---
+    # Create the final (H, W, 2) array
+    pixel_coords = np.stack([u_gl, v_numpy], axis=-1)
+    
+    # --- 8. Handle Background (as in original) ---
+    # For background pixels, set their coordinate to their original [u, v] index
+    
+    # Create the original (u,v) grid
+    u_grid, v_grid = np.meshgrid(np.arange(W), np.arange(H))
+    original_pixel_grid = np.stack([u_grid, v_grid], axis=-1)
+    
+    # Apply the original grid to all pixels masked as background
+    pixel_coords[background_mask] = original_pixel_grid[background_mask]
             
     return pixel_coords
 

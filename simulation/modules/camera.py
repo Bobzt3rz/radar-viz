@@ -148,16 +148,19 @@ class Camera:
         Renders the world and un-projects the depth buffer
         to create a (H, W, 3) map of world coordinates.
         
+        This is a vectorized version of the original loop-based function.
+        
         Returns:
             - world_coords (H, W, 3) np.ndarray
             - modelview matrix (np.ndarray)
             - projection matrix (np.ndarray)
             - viewport (np.ndarray)
         """
-        # ... (Step 1: Get Depth Buffer) ...
+        # --- 1. Get Depth Buffer (as in original) ---
+        # depth_buffer is (H, W), with (0,0) at top-left
         depth_buffer = self._get_depth_buffer(world, width, height)
         
-        # --- 2. Get Matrices ---
+        # --- 2. Get Matrices (as in original) ---
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glMatrixMode(GL_MODELVIEW)
@@ -172,38 +175,58 @@ class Camera:
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
         glPopMatrix()
+
+        # --- 3. Vectorized Un-projection ---
         
-        # --- 3. Un-project Depth Image (this block is already here) ---
-        world_coords = np.empty((height, width, 3), dtype=float)
-        viewport = (0, 0, width, height) # <-- This was already here
-        # Create (u, v) coordinates for all pixels
+        # Define the viewport used (as in original)
+        viewport = (0, 0, width, height)
+        v_x, v_y, v_w, v_h = viewport
+
+        # Create (u, v) grids (as in original)
+        # u_grid: [0...W-1]
+        # v_grid: [0...H-1] (0 is top)
         u_grid, v_grid = np.meshgrid(np.arange(width), np.arange(height))
         
-        # Un-project all points at once
-        # Note: This is slow and can be optimized further, but
-        # it's a direct replacement for your loop.
-        world_coords = np.empty((height, width, 3), dtype=float)
-        viewport = (0, 0, width, height) # Viewport used for depth capture
+        # Flip v to be bottom-left for gluUnProject (as in original)
+        # v_gl_grid: [H-1...0]
+        v_gl_grid = (height - 1) - v_grid
         
-        for v_idx in range(height):
-            for u_idx in range(width):
-                depth = depth_buffer[v_idx, u_idx]
+        # --- Replicate gluUnProject Math ---
+        
+        # 1. Map (u, v_gl, depth) to Normalized Device Coordinates (NDC)
+        # x_ndc = (u_pixel - v_x) * (2.0 / v_w) - 1.0
+        # y_ndc = (v_gl_pixel - v_y) * (2.0 / v_h) - 1.0
+        # z_ndc = depth * 2.0 - 1.0
+        x_ndc = (u_grid - v_x) * (2.0 / v_w) - 1.0
+        y_ndc = (v_gl_grid - v_y) * (2.0 / v_h) - 1.0
+        z_ndc = depth_buffer * 2.0 - 1.0
+        
+        # 2. Create (H, W, 4) array of homogeneous NDC coordinates
+        ndc_coords = np.stack([x_ndc, y_ndc, z_ndc, np.ones_like(z_ndc)], axis=-1)
 
-                # Get the (u,v) from the grid (top-left)
-                u = u_grid[v_idx, u_idx]
-                v = v_grid[v_idx, u_idx]
-
-                # Flip v to be bottom-left for gluUnProject
-                v_gl = (height - 1) - v
-                # --------------------------
-
-                if depth < 1.0:
-                    world_x, world_y, world_z = gluUnProject(
-                        u, v_gl, depth,  # <-- Use v_gl
-                        modelview, projection, viewport
-                    )
-                    world_coords[v_idx, u_idx] = [world_x, world_y, world_z]
-                else:
-                    world_coords[v_idx, u_idx] = [0, 0, 0]
+        # 3. Get Inverse MVP Matrix
+        # As established, the row-major MVP matrix is (modelview @ projection)
+        inv_mvp_matrix = np.linalg.inv(modelview @ projection)
+        
+        # 4. Transform NDC to World (Homogeneous)
+        # P_world_row = P_ndc_row @ M_inv_mvp_row
+        world_coords_homogeneous = ndc_coords @ inv_mvp_matrix
+        
+        # 5. Perspective Divide
+        # Get the 'w' component (H, W, 1)
+        w = world_coords_homogeneous[..., 3, np.newaxis]
+        
+        # Avoid division by zero
+        w[w == 0] = 1.0
+        
+        # (H, W, 3)
+        world_coords = world_coords_homogeneous[..., :3] / w
+        
+        # --- 4. Handle Background (as in original) ---
+        # Create a mask for background pixels (where depth >= 1.0)
+        background_mask = (depth_buffer >= 1.0)
+        
+        # Set background pixels to [0, 0, 0]
+        world_coords[background_mask] = [0.0, 0.0, 0.0]
 
         return world_coords, modelview, projection, viewport
