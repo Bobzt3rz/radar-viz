@@ -11,7 +11,7 @@ class EgoSensorRig:
     """
     def __init__(self):
         # 1. Store the rig's own pose, todo, make so radar is not in same position
-        self.position = np.array([0, 5, -10], dtype=float)
+        self.position = np.array([0, 1, -10], dtype=float)
         self.target = np.array([0, 0, 0], dtype=float)
         self.up = np.array([0, 1, 0], dtype=float)
 

@@ -142,6 +142,39 @@ def save_flow_histogram(flow_map: np.ndarray, filename: str):
     plt.close() # Close the plot to free memory
     print(f"Saved flow histogram to {filename}")
 
+def save_radar_data_as_ply(data_array: np.ndarray, filename: str):
+    """
+    Saves an (N, 8) data array as an ASCII PLY file.
+    The PLY file will contain: [x_local, y_local, z_local, doppler, azimuth]
+    """
+    
+    # Select the columns we want to save:
+    # 3: x_local, 4: y_local, 5: z_local, 6: doppler, 7: azimuth
+    data_to_save = data_array[:, [3, 4, 5, 6, 7]]
+    
+    num_points = data_to_save.shape[0]
+
+    # Create the ASCII PLY header with extra properties
+    header = f"""ply
+        format ascii 1.0
+        element vertex {num_points}
+        property float x
+        property float y
+        property float z
+        property float doppler
+        property float azimuth
+        end_header
+        """
+
+    try:
+        with open(filename, 'w') as f:
+            f.write(header)
+            # Save the (N, 5) data as space-separated values
+            np.savetxt(f, data_to_save, fmt='%.8f')
+        print(f"Saved (N, 5) PLY data to {filename}")
+    except Exception as e:
+        print(f"Error saving PLY file: {e}")
+
 def make_colorwheel():
     """
     Generates a color wheel for optical flow visualization as presented in:

@@ -17,7 +17,8 @@ from modules.utils import (
     save_flow_histogram,
     build_velocity_map,
     project_to_2d,
-    save_grayscale_map
+    save_grayscale_map,
+    save_radar_data_as_ply
 )
 
 sys.path.append('..') # Add parent directory to path
@@ -44,7 +45,7 @@ if __name__ == "__main__":
     # Add a cube moving in the +X direction
     cube1 = Cube(
         position=[-5.0, 0.0, 0.0],
-        velocity=[2.0, 1.0, 0.0],
+        velocity=[2.0, 1.0, 0.5],
         texture_path = TEXTURE_FILE
     )
     cube1.id_color = [1.0 / 255.0, 0.0, 0.0] # ID Color 1
@@ -67,11 +68,20 @@ if __name__ == "__main__":
     static_cube.id_color = [3.0 / 255.0, 0.0, 0.0] # ID 3 (static object)
     world.add_entity(static_cube)
 
+    static_cube2 = Cube(
+        position=[2.0, 0.0, -2.0],
+        velocity=[0.0, 0.0, 0.0],
+        texture_path = TEXTURE_FILE
+    )
+    static_cube2.id_color = [4.0 / 255.0, 0.0, 0.0] # ID 4 (static object)
+    world.add_entity(static_cube2)
+
     id_to_velocity_map = {
         # (R, G, B) : [vx, vy, vz]
         (1, 0, 0): cube1.velocity,
         (2, 0, 0): cube2.velocity,
         (3, 0, 0): static_cube.velocity,
+        (4, 0, 0): static_cube2.velocity,
         (0, 0, 0): np.array([0.0, 0.0, 0.0]) # Background
     }
 
@@ -105,14 +115,22 @@ if __name__ == "__main__":
         world.update(dt)
         rig.update(dt, EGO_VELOCITY)
 
-        radar_points = rig.get_radar().simulate_scan(world)
+        # radar_points_data is now an (N, 4) NumPy array [x, y, z, vr]
+        radar_points_data = rig.get_radar().simulate_scan(
+            world, 
+            id_to_velocity_map,
+            EGO_VELOCITY
+        )
 
         # Clear the old points
         radar_world.clear_entities()
 
         # Add the new points
-        for point_3d in radar_points:
-            radar_world.add_entity(Point(position=point_3d, color=[0.0, 1.0, 0.0]))
+        # We only need the position for visualization
+        for point_data in radar_points_data:
+            # point_data is [x, y, z, vr]
+            # We only need the first 3 elements for visualization
+            radar_world.add_entity(Point(position=point_data[:3], color=[0.0, 1.0, 0.0]))
 
         # 2. Get Ground Truth Data for Frame N
         cam = rig.get_camera()
@@ -120,11 +138,6 @@ if __name__ == "__main__":
         current_world_pos_map, current_modelview, current_projection, current_viewport = \
             cam.get_world_position_map(world, CAM_W, CAM_H)
         current_id_map = cam.get_id_map(world, CAM_W, CAM_H)
-        
-        # --- 6. Save on first frame ---
-        if frame_count % 100 == 0 and radar_points.size > 0:
-            save_as_ply(radar_points, str(frame_count) + ".ply")
-            saved_frame = True
         
         # Render the current world state
         renderer.begin_frame()
@@ -152,12 +165,13 @@ if __name__ == "__main__":
         # --- 7. RUN INFERENCE & COMPARE (Using Frame N-1 and Frame N) ---
         if previous_image is not None and \
             previous_id_map is not None and \
-            previous_world_pos_map is not None and  \
-            frame_count % 20 == 0:
+            previous_world_pos_map is not None and \
+            radar_points_data.size > 0 and \
+            frame_count % 1 == 0:
             print(f"\n--- Running inference & validation on frame {frame_count} ---")
             
             # A. Get Estimated Flow (from model)
-            estimated_flow_map = optical_flow.inference(previous_image, current_image)
+            estimated_flow_map = optical_flow.inference_cv(previous_image, current_image)
 
             print(f"Saved GT flow, Estimated flow, and EPE map for frame {frame_count}")
             
@@ -194,6 +208,10 @@ if __name__ == "__main__":
             save_grayscale_map(epe_map, f"epe_map_{frame_count}.png", vmax=50) # vmax=50 means errors > 50px appear white
 
             print(f"Saved GT flow, Estimated flow, and EPE map for frame {frame_count}")
+
+            # 1. Save the Radar PLY file
+            output_filename_pcd = f"radar_data_{frame_count}.ply"
+            save_radar_data_as_ply(radar_points_data, output_filename_pcd)
             # -------------------------
             
             # Only calculate error on pixels that actually moved
