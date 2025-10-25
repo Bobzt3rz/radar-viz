@@ -57,13 +57,16 @@ class Cube(Entity):
         [0.0, 1.0],
     ], dtype=np.float32)
 
-    def __init__(self, position: List[float], velocity: List[float], texture_path: Optional[str] = None):
+    def __init__(self, position: List[float], velocity: List[float], 
+                 texture_path: Optional[str] = None,
+                 scale: List[float] = [1.0, 1.0, 1.0]):
         # Call the parent class (Entity) constructor
         super().__init__(position=position, velocity=velocity)
         # Set to white so texture isn't tinted
         self.color = [1.0, 1.0, 1.0]
         # A unique color to identify this object in a render
         self.id_color = [0.0, 0.0, 0.0]
+        self.scale = np.array(scale, dtype=np.float32)
 
         if texture_path:
             self.tex_id = self._load_texture(texture_path)
@@ -108,6 +111,7 @@ class Cube(Entity):
         """ Draws the cube at its position with texture. """
         glPushMatrix()
         glTranslatef(self.position[0], self.position[1], self.position[2])
+        glScalef(self.scale[0], self.scale[1], self.scale[2])
         
         if self.tex_id is not None and self.tex_id != -1:
             glEnable(GL_TEXTURE_2D)
@@ -135,6 +139,7 @@ class Cube(Entity):
         """ Draws the cube at its position with its unique ID color. """
         glPushMatrix()
         glTranslatef(self.position[0], self.position[1], self.position[2])
+        glScalef(self.scale[0], self.scale[1], self.scale[2])
         
         glColor3fv(self.id_color) # <-- Uses ID color
         glBegin(GL_QUADS)

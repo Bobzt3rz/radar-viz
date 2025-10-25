@@ -59,10 +59,19 @@ if __name__ == "__main__":
     cube2.id_color = [2.0 / 255.0, 0.0, 0.0] # ID Color 2
     world.add_entity(cube2)
 
+    static_cube = Cube(
+        position=[0.0, 0.0, 0.0],
+        velocity=[0.0, 0.0, 0.0],
+        texture_path = TEXTURE_FILE
+    )
+    static_cube.id_color = [3.0 / 255.0, 0.0, 0.0] # ID 3 (static object)
+    world.add_entity(static_cube)
+
     id_to_velocity_map = {
         # (R, G, B) : [vx, vy, vz]
         (1, 0, 0): cube1.velocity,
         (2, 0, 0): cube2.velocity,
+        (3, 0, 0): static_cube.velocity,
         (0, 0, 0): np.array([0.0, 0.0, 0.0]) # Background
     }
 
