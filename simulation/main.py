@@ -10,6 +10,7 @@ from modules.entities import Cube, Point
 from modules.gl_renderer import OpenGLRenderer
 from modules.ego_sensor_rig import EgoSensorRig
 from modules.optical_flow import OpticalFlow
+from modules.velocity_solver import calculate_3d_velocity
 from modules.utils import (
     save_as_ply, 
     flow_to_image, 
@@ -95,6 +96,9 @@ if __name__ == "__main__":
 
     # Get camera viewport dimensions
     CAM_H, CAM_W = viewport_cam[3], viewport_cam[2]
+    # Get camera intrinsics
+    cam_intrinsics = rig.get_camera().get_intrinsics(CAM_W, CAM_H)
+
     # Create a base (u,v) grid for flow calculation
     u_coords, v_coords = np.meshgrid(np.arange(CAM_W), np.arange(CAM_H))
     pixel_pos_map_prev = np.dstack([u_coords, v_coords])
@@ -239,9 +243,6 @@ if __name__ == "__main__":
 
             # D. Update visualization for *next* loop
             flow_image = flow_to_image(estimated_flow_map)
-            
-            # (Save histograms/files as needed)
-            # save_flow_histogram(estimated_flow_map, f"flow_hist_{frame_count}.png")
 
 
         # --- 8. Update State for Next Loop ---

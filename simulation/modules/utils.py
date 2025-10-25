@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from OpenGL.GLU import gluProject
-from typing import Tuple
+from typing import Tuple, Optional
 
 def build_velocity_map(id_map: np.ndarray, id_to_velocity: dict) -> np.ndarray:
     """
@@ -89,6 +89,45 @@ def project_to_2d(world_points: np.ndarray, modelview: np.ndarray, projection: n
             
     return pixel_coords
 
+def get_cam_coords_from_world(
+    world_pos_t1: np.ndarray, 
+    modelview: np.ndarray
+) -> Optional[np.ndarray]:
+    """Converts a 3D world point to 3D camera-frame coordinates."""
+    world_pos_t1_homo = np.append(world_pos_t1, 1.0)
+    cam_pos_t1_homo = world_pos_t1_homo @ modelview
+    
+    # Check for division by zero
+    if cam_pos_t1_homo[3] == 0:
+        return None
+        
+    cam_pos_t1 = cam_pos_t1_homo[:3] / cam_pos_t1_homo[3]
+    return cam_pos_t1
+
+def get_pixel_from_world(
+    world_pos_t1: np.ndarray, 
+    modelview: np.ndarray, 
+    projection: np.ndarray, 
+    viewport: Tuple[int, int, int, int], 
+    CAM_H: int
+) -> Optional[Tuple[float, float]]:
+    """Projects a 3D world point to 2D pixel coordinates (top-left origin)."""
+    try:
+        px, py_gl, pz_norm = gluProject(
+            world_pos_t1[0], world_pos_t1[1], world_pos_t1[2],
+            modelview, projection, viewport
+        )
+        
+        # Flip v from OpenGL's bottom-left to NumPy's top-left
+        v_pix = (CAM_H - 1) - py_gl
+        u_pix = px
+        
+        # Return as float for sub-pixel accuracy
+        return (u_pix, v_pix)
+    except Exception:
+        # gluProject can fail (e.g., if matrices are non-invertible)
+        return None
+    
 def save_as_ply(points: np.ndarray, filename: str):
     """Saves an (N, 3) point cloud as a .ply file."""
     # Create the PLY header
@@ -113,34 +152,6 @@ def save_flow_map(flow_map: np.ndarray, filename: str):
     """Saves an (H, W, 2) flow map as a .npy file."""
     np.save(filename, flow_map)
     print(f"Saved flow map to {filename}")
-
-def save_flow_histogram(flow_map: np.ndarray, filename: str):
-    """
-    Calculates and saves a histogram of the flow vector magnitudes.
-    """
-    # 1. Calculate the magnitude (speed) for every pixel
-    magnitudes = np.linalg.norm(flow_map, axis=2)
-    
-    # 2. Flatten the 2D array of magnitudes into a 1D list
-    magnitudes_flat = magnitudes.flatten()
-    
-    # 3. Create the plot
-    plt.figure(figsize=(10, 6))
-    plt.hist(magnitudes_flat, bins=100, range=(0, np.max(magnitudes_flat)))
-    
-    # 4. Use a log scale for the Y-axis (Count)
-    # This is critical, as it will prevent the "zero-flow" pixels
-    # from completely dwarfing all other values.
-    plt.yscale('log') 
-    
-    plt.title('Flow Vector Magnitude Distribution')
-    plt.xlabel('Flow Magnitude (pixels/frame)')
-    plt.ylabel('Count (log scale)')
-    
-    # 5. Save the figure
-    plt.savefig(filename)
-    plt.close() # Close the plot to free memory
-    print(f"Saved flow histogram to {filename}")
 
 def save_radar_data_as_ply(data_array: np.ndarray, filename: str):
     """

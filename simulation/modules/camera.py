@@ -1,7 +1,7 @@
 from OpenGL.GL import *
 from OpenGL.GLU import *
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Dict
 
 from .world import World
 from .entities import Cube
@@ -230,3 +230,23 @@ class Camera:
         world_coords[background_mask] = [0.0, 0.0, 0.0]
 
         return world_coords, modelview, projection, viewport
+    
+    def get_intrinsics(self, width: int, height: int) -> Dict[str, float]:
+            """
+            Calculates camera intrinsic parameters (fx, fy, cx, cy)
+            based on the camera's FOV and the viewport size.
+            """
+            # Vertical FOV from camera object
+            fov_y_rad = self.fov * np.pi / 180.0
+            
+            # Calculate focal lengths
+            fy = (height / 2.0) / np.tan(fov_y_rad / 2.0)
+            # Aspect ratio
+            aspect = width / float(height)
+            fx = fy * aspect # Assuming fov is vertical
+            
+            # Principal point (image center)
+            cx = width / 2.0
+            cy = height / 2.0
+            
+            return {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
