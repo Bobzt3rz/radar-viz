@@ -10,11 +10,11 @@ from modules.entities import Cube, Point
 from modules.gl_renderer import OpenGLRenderer
 from modules.ego_sensor_rig import EgoSensorRig
 from modules.optical_flow import OpticalFlow
-from modules.velocity_solver import estimate_full_displacement
+from modules.velocity_solver import estimate_full_displacement # Use only the solver
 from modules.utils import (
-    save_as_ply, 
-    flow_to_image, 
-    save_flow_map, 
+    save_as_ply,
+    flow_to_image,
+    save_flow_map,
     build_velocity_map,
     project_to_2d,
     save_grayscale_map,
@@ -25,294 +25,363 @@ sys.path.append('..') # Add parent directory to path
 
 WINDOW_WIDTH, WINDOW_HEIGHT = 640, 360
 TEXTURE_FILE = "/home/bobberman/programming/radar/radar-viz/simulation/assets/checkerboard.png"
+# TEXTURE_FILE = "/home/bobberman/programming/radar/radar-viz/simulation/assets/optical_flow_texture.png"
+# --- EGO_VELOCITY in OpenGL World Frame ---
+EGO_VELOCITY_WORLD = np.array([0.0, 0.0, 0.0], dtype=float)
 
-EGO_VELOCITY = np.array([0.0, 0.0, 0.0], dtype=float)
+def get_intrinsics_from_projection_matrix(projection_matrix: np.ndarray, width: int, height: int) -> dict:
+    """
+    Extracts fx, fy, cx, cy from a standard OpenGL projection matrix
+    created by gluPerspective or similar.
+
+    Assumes standard OpenGL projection matrix layout (column-major order from glGetDoublev).
+    Matrix P = [ P0 P4 P8  P12 ]
+              [ P1 P5 P9  P13 ]
+              [ P2 P6 P10 P14 ]
+              [ P3 P7 P11 P15 ]
+
+    Relationships (approximately, may vary slightly based on matrix construction):
+    fx = P[0] * width / 2
+    fy = P[5] * height / 2
+    cx = (1 - P[8]) * width / 2  (or often just width / 2 if P[8] is near 0)
+    cy = (1 + P[9]) * height / 2 (or often just height / 2 if P[9] is near 0) - Accounts for OpenGL Y flip? Check this.
+    Let's use the simpler center assumption for cx, cy first.
+
+    More robust (from projection matrix elements to K):
+    fx = P[0,0] * width / 2.0
+    fy = P[1,1] * height / 2.0
+    cx = width/2.0  - P[0,2]*width/2.0   # P[0,2] = (cx - width/2) / (width/2) --> Check derivation
+    cy = height/2.0 - P[1,2]*height/2.0  # P[1,2] = (cy - height/2) / (height/2) --> Check derivation
+
+    Let's use the simplest version assuming center principal point:
+    fx = ProjMat[0,0] * width / 2.0
+    fy = ProjMat[1,1] * height / 2.0
+    cx = width / 2.0
+    cy = height / 2.0
+    """
+    # glGetDoublev returns column-major, reshape transposes to row-major
+    ProjMat = projection_matrix.reshape(4, 4).T
+
+    fx = ProjMat[0, 0] * width / 2.0
+    fy = ProjMat[1, 1] * height / 2.0 # Check sign convention for fy
+    cx = width / 2.0
+    cy = height / 2.0 # Assuming principal point at center
+
+    # Let's verify fy calculation using relation to near/far and fov
+    # P[1,1] = cot(fov_y / 2)
+    # fy_alt = (height / 2.0) * ProjMat[1, 1] # Check if this matches fy from FOV
+    # fov_y_rad = np.arctan(1.0 / ProjMat[1,1]) * 2.0
+    # fy_alt2 = (height / 2.0) / np.tan(fov_y_rad / 2.0)
+
+    # Need to be careful about OpenGL's NDC Y direction vs image Y direction.
+    # Often fy extracted needs negation depending on convention.
+    # Let's assume the calculation from FOV in camera.py is the reference for now.
+
+    print(f"  [Intrinsics Debug] From Proj Mat: fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
+
+    # Return values consistent with get_intrinsics calculation method for now
+    # We will just use this function to *compare* values
+    # return {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+    return {'fx': fx, 'fy': abs(fy), 'cx': cx, 'cy': cy} # Let's try abs(fy) as projection matrix might have negative element
 
 if __name__ == "__main__":
-    # 1. Simulation Setup
+    # 1. Simulation Setup (Same as before)
     world = World()
     radar_world = World()
     rig = EgoSensorRig()
     optical_flow = OpticalFlow()
     renderer = OpenGLRenderer(WINDOW_WIDTH, WINDOW_HEIGHT, "Sensor Rig Sim")
-    
-    # --- SIMPLIFIED SCENE ---
     cube2 = Cube(
-        position=[3.0, 2.0, 2.0],
-        velocity=[-1.0, 0.0, 0.0], # True Absolute Velocity
+        position=[1.0, 0.25, -7.0], # World Coordinates (OpenGL: +X R, +Y U, +Z Out)
+        velocity=[-1.0, 0.0, 0.0], # World Coordinates (OpenGL)
         texture_path = TEXTURE_FILE
     )
     cube2.id_color = [2.0 / 255.0, 0.0, 0.0]
     world.add_entity(cube2)
-
     id_to_velocity_map = {
         (2, 0, 0): cube2.velocity,
         (0, 0, 0): np.array([0.0, 0.0, 0.0])
     }
 
-    # 2. Define viewports
+    # 2. Viewports and Intrinsics (Same as before)
     viewport_cam = (0, WINDOW_HEIGHT // 2, WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
     viewport_radar = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2, WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
     viewport_flow = (0, 0, WINDOW_WIDTH, WINDOW_HEIGHT // 2)
-
     CAM_H, CAM_W = viewport_cam[3], viewport_cam[2]
     cam_intrinsics = rig.get_camera().get_intrinsics(CAM_W, CAM_H)
     fx, fy, cx, cy = cam_intrinsics['fx'], cam_intrinsics['fy'], cam_intrinsics['cx'], cam_intrinsics['cy']
 
-    pixel_pos_map_prev = np.dstack(np.meshgrid(np.arange(CAM_W), np.arange(CAM_H)))
+    u_coords, v_coords = np.meshgrid(np.arange(CAM_W), np.arange(CAM_H))
+    pixel_pos_map_prev = np.stack([u_coords, v_coords], axis=-1) # (H, W, 2)
 
-    # 3. Main Loop
+    # 3. Main Loop Setup (Same as before)
     dt = 0.016
     frame_count = 0
     previous_image = None
     previous_world_pos_map = None
     previous_id_map = None
-    previous_radar_points_data = np.empty((0, 8), dtype=float)
     previous_modelview = None
     previous_projection = None
     previous_viewport = None
-    previous_pixel_positions = {}  # Track pixel positions for ground truth flow
     flow_image = None
-    
-    while not renderer.should_close():
-        # 4. SIMULATION STEP
-        world.update(dt)
-        rig.update(dt, EGO_VELOCITY)
-        radar_points_data = rig.get_radar().simulate_scan(world, id_to_velocity_map, EGO_VELOCITY, dt)
 
+
+    # --- Define Coordinate System Transformations (Same as before) ---
+    R_RA = np.array([
+        [ 0,  0,  1], [ -1, 0,  0], [ 0, -1,  0]
+    ])
+    t_RA = np.array([0.0, 0.0, 0.0])
+    T_RA = np.identity(4); T_RA[:3, :3] = R_RA; T_RA[:3, 3] = t_RA
+    T_opengl_to_solver = np.array([
+        [1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]
+    ])
+    T_solver_to_opengl = np.linalg.inv(T_opengl_to_solver)
+
+
+    while not renderer.should_close():
+        # 4. SIMULATION STEP (Same)
+        world.update(dt)
+        rig.update(dt, EGO_VELOCITY_WORLD)
+
+        # --- RADAR DATA FOR VISUALIZATION ONLY (Same) ---
+        _radar_points_data_vis = rig.get_radar().simulate_scan(world, id_to_velocity_map, EGO_VELOCITY_WORLD, dt)
         radar_world.clear_entities()
-        for point_data in radar_points_data:
-            radar_world.add_entity(Point(position=point_data[:3], color=[0.0, 1.0, 0.0]))
+        if _radar_points_data_vis.shape[0] > 0:
+             for point_data in _radar_points_data_vis:
+                  radar_world.add_entity(Point(position=point_data[0:3], color=[0.0, 1.0, 0.0]))
+        # --- END RADAR VISUALIZATION ---
 
         cam = rig.get_camera()
         current_world_pos_map, current_modelview, current_projection, current_viewport = \
-            cam.get_world_position_map(world, CAM_W, CAM_H)
+            cam.get_world_position_map(world, CAM_W, CAM_H) # OpenGL coords
         current_id_map = cam.get_id_map(world, CAM_W, CAM_H)
-        
-        # Track ground truth pixel positions for flow validation
-        for point_idx, point_data in enumerate(radar_points_data):
-            world_pos = point_data[:3]
-            try:
-                px, py_gl, pz = gluProject(
-                    world_pos[0], world_pos[1], world_pos[2],
-                    current_modelview, current_projection, current_viewport
-                )
-                u_pix = px
-                v_pix = (CAM_H - 1) - py_gl
-            except:
-                pass
-        
-        # 5. RENDER
+
+        # 5. RENDER (Same)
         renderer.begin_frame()
         renderer.render_view(world, rig.get_camera(), viewport_cam)
         renderer.render_view(radar_world, rig.get_radar(), viewport_radar)
         if flow_image is not None:
-            flow_h, flow_w, _ = flow_image.shape
-            viewport_flow_adjusted = (0, 0, flow_w, flow_h)
-            renderer.draw_image_in_viewport(flow_image, viewport_flow_adjusted)
+             flow_h, flow_w, _ = flow_image.shape
+             viewport_flow_adjusted = (0, 0, flow_w, flow_h)
+             renderer.draw_image_in_viewport(flow_image, viewport_flow_adjusted)
         current_image = renderer.read_viewport_pixels(viewport_cam)
         renderer.end_frame()
 
-        # 6. RUN INFERENCE & COMPARE
+
+        # 6. SOLVER INPUT CALCULATION & EXECUTION
         if previous_image is not None and \
-            previous_radar_points_data.size > 0 and \
             previous_id_map is not None and \
             previous_world_pos_map is not None and \
+            previous_projection is not None and \
             previous_modelview is not None:
-            
-            # A. Get Estimated Flow
+
+            print(f"\n[OPTICAL FLOW MODEL]")
             estimated_flow_map_raw = optical_flow.inference(previous_image, current_image)
 
-            # 1. Get velocity map for Frame N-1 (t-1)
+            # B. Calculate PERFECT Ground Truth Flow
+            print(f"\n[GROUND TRUTH FLOW CALC]: Calculating perfect GT flow map...")
             world_vel_map_prev = build_velocity_map(previous_id_map, id_to_velocity_map)
-            # 2. Find true 3D pos for Frame N (t) by moving Frame N-1
             world_pos_map_curr_gt = previous_world_pos_map + (world_vel_map_prev * dt)
-            # 3. Project these new 3D points back to 2D pixels using *current* camera matrices
             pixel_pos_map_curr_gt = project_to_2d(
-                world_pos_map_curr_gt, 
-                current_modelview, 
-                current_projection, 
-                current_viewport
+                world_pos_map_curr_gt, current_modelview, current_projection, current_viewport
             )
-            # 4. Calculate the true flow map
             ground_truth_flow_map = pixel_pos_map_curr_gt - pixel_pos_map_prev
+            print(f"[GROUND TRUTH FLOW CALC]: Done.")
 
-            # --- E. 3D VELOCITY ESTIMATION ---
+
             print("\n" + "="*80)
-            print("=== VELOCITY ESTIMATION WITH FLOW DIAGNOSTICS ===")
+            print("=== VELOCITY ESTIMATION (Using inference + Correct Transforms) ===")
             print("="*80)
-            
-            # Coordinate transformation matrices
-            T_RA = np.identity(4)
-            T_RA[:3, :3] = np.array([
-                [ 0,  0, -1],  # SAE_X (forward) = -Camera_Z
-                [-1,  0,  0],  # SAE_Y (left)    = -Camera_X
-                [ 0,  1,  0]   # SAE_Z (up)      =  Camera_Y
-            ])
-            R_RA = T_RA[:3, :3]
-            R_SAE_to_Camera = R_RA.T
-            
-            ego_displacement = EGO_VELOCITY * dt
+
+            # --- Define World-to-SolverCam Transform for time t-1 (Same) ---
+            T_world_to_solver_cam_t1 = previous_modelview @ T_opengl_to_solver
+            R_world_to_solver_cam_t1 = T_world_to_solver_cam_t1[:3, :3]
+
+            # --- Calculate Ego Motion T_AB in Solver Camera Frame (Same) ---
+            ego_displacement_world = EGO_VELOCITY_WORLD * dt
+            ego_displacement_cam_solver = R_world_to_solver_cam_t1 @ (-ego_displacement_world)
             T_AB = np.identity(4)
-            T_AB[:3, 3] = ego_displacement
+            T_AB[:3, 3] = ego_displacement_cam_solver
+
 
             velocity_estimates = []
-            valid_point_count = 0
+            processed_points = 0
 
-            for point_idx, point_data_t1 in enumerate(previous_radar_points_data):
-                
-                if valid_point_count >= 1:
-                    break
-    
-                print(f"\n{'─'*80}")
-                print(f"POINT {point_idx + 1} - FLOW DIRECTION CHECK")
-                print(f"{'─'*80}")
-                
-                # Get radar data
-                world_pos_t1 = point_data_t1[0:3]
-                local_pos_radar_t1 = point_data_t1[3:6]
-                radial_vel_magnitude = point_data_t1[6]
-                
-                norm = np.linalg.norm(local_pos_radar_t1)
-                if norm == 0: continue
-                unit_radial_SAE = local_pos_radar_t1 / norm
-                unit_radial_camera = R_SAE_to_Camera @ unit_radial_SAE
-                vx_r, vy_r, vz_r = unit_radial_SAE
-                
-                # Project to image
-                try:
-                    px, py_gl, pz_norm = gluProject(
-                        world_pos_t1[0], world_pos_t1[1], world_pos_t1[2],
-                        previous_modelview, previous_projection, previous_viewport
+            # --- Iterate through PIXELS of the PREVIOUS frame ---
+            for v_idx in range(CAM_H):
+                 for u_idx in range(CAM_W):
+                    if processed_points >= 1: break # Limit logs
+
+                    id_tuple_t1 = tuple(previous_id_map[v_idx, u_idx])
+                    if id_tuple_t1 == (0, 0, 0): continue # Skip background
+
+                    world_pos_t1 = previous_world_pos_map[v_idx, u_idx] # OpenGL World Coords
+                    obj_vel_world_t1 = id_to_velocity_map.get(id_tuple_t1)
+                    if obj_vel_world_t1 is None: continue
+
+                    # --- Transform World Pos (t-1) to Solver Camera Frame (t-1) (Same) ---
+                    world_pos_t1_homo = np.append(world_pos_t1, 1.0)
+                    P_A_solver_homo = T_world_to_solver_cam_t1 @ world_pos_t1_homo
+                    w_pa = P_A_solver_homo[3]
+                    if abs(w_pa) < 1e-8: continue
+                    P_A_solver = P_A_solver_homo[:3] / w_pa
+                    d_t1 = P_A_solver[2]
+                    if d_t1 <= 1e-3: continue
+
+                    # --- Calculate up/vp directly from P_A_solver (Same) ---
+                    if abs(P_A_solver[2]) < 1e-6: continue
+                    up_t1 = P_A_solver[0] / P_A_solver[2]
+                    vp_t1 = P_A_solver[1] / P_A_solver[2]
+
+                    # --- GET ESTIMATED FLOW ---
+                    pixel_flow_vector = ground_truth_flow_map[v_idx, u_idx]
+                    flow_u_pix, flow_v_pix = pixel_flow_vector
+
+                    # --- GET PERFECT GT FLOW (for comparison) ---
+                    perfect_flow_vector = ground_truth_flow_map[v_idx, u_idx]
+                    perfect_flow_u, perfect_flow_v = perfect_flow_vector
+
+
+                    # TODO: TESTING INTRINSICS
+                    # --- Calculate (uq, vq) using ESTIMATED flow ---
+                    # --- Get Intrinsics using BOTH methods ---
+                    print("\n[INTRINSICS CALCULATION]:")
+                    # Method 1: From Camera FOV
+                    intrinsics_fov = rig.get_camera().get_intrinsics(CAM_W, CAM_H)
+                    fx_fov, fy_fov, cx_fov, cy_fov = intrinsics_fov['fx'], intrinsics_fov['fy'], intrinsics_fov['cx'], intrinsics_fov['cy']
+                    print(f"  From FOV        : fx={fx_fov:.4f}, fy={fy_fov:.4f}, cx={cx_fov:.4f}, cy={cy_fov:.4f}")
+
+                    # Method 2: From previous frame's Projection Matrix
+                    intrinsics_proj = get_intrinsics_from_projection_matrix(previous_projection, CAM_W, CAM_H)
+                    fx_proj, fy_proj, cx_proj, cy_proj = intrinsics_proj['fx'], intrinsics_proj['fy'], intrinsics_proj['cx'], intrinsics_proj['cy']
+                    print(f"  From Projection        : fx={fx_proj:.4f}, fy={fy_proj:.4f}, cx={cx_proj:.4f}, cy={cy_proj:.4f}")
+                    # Values printed inside the helper function
+
+                    # --- USE INTRINSICS FROM FOV METHOD for consistency with setup ---
+                    fx, fy, cx, cy = fx_proj, fy_proj, cx_proj, cy_proj
+                    print(f"  Using Projection-based intrinsics for solver.")
+
+
+                    u_pix_t1 = u_idx # Pixel index at t-1
+                    v_pix_t1 = v_idx
+                    u_pix_t2 = u_pix_t1 + flow_u_pix # Estimated pixel pos at t
+                    v_pix_t2 = v_pix_t1 + flow_v_pix
+                    uq = (u_pix_t2 - cx) / fx
+                    vq = (v_pix_t2 - cy) / fy
+
+                    # --- Calculate Radial Velocity Inputs (using Solver Frames - Same logic) ---
+                    obj_vel_cam_solver = R_world_to_solver_cam_t1 @ obj_vel_world_t1
+                    ego_velocity_cam_solver = R_world_to_solver_cam_t1 @ EGO_VELOCITY_WORLD
+                    V_relative_cam_solver = obj_vel_cam_solver - ego_velocity_cam_solver
+                    V_relative_radar_sae = R_RA @ V_relative_cam_solver
+                    t_abs_cam_solver = obj_vel_cam_solver * dt
+                    Q_cam_solver = P_A_solver + t_abs_cam_solver
+                    Q_cam_solver_homo = np.append(Q_cam_solver, 1.0)
+                    Q_radar_sae_homo = T_RA @ Q_cam_solver_homo
+                    w_qr = Q_radar_sae_homo[3]
+                    if abs(w_qr) < 1e-8: continue
+                    Q_radar_sae = Q_radar_sae_homo[:3] / w_qr
+                    range_q = np.linalg.norm(Q_radar_sae)
+                    if range_q < 1e-6: continue
+                    unit_radial_sae = Q_radar_sae / range_q
+                    vx_r, vy_r, vz_r = unit_radial_sae
+                    radial_vel_magnitude = np.dot(V_relative_radar_sae, unit_radial_sae)
+
+                    # TODO: THIS WORKS
+                    # # --- Calculate uq/vq directly from Q_cam_solver ---
+                    if abs(Q_cam_solver[2]) < 1e-6: continue
+                    correct_uq = Q_cam_solver[0] / Q_cam_solver[2]
+                    correct_vq = Q_cam_solver[1] / Q_cam_solver[2]
+                    print(f"[CORRECT]:")
+                    print(f"  (correct_uq, correct_vq):    ({correct_uq:.4f}, {correct_vq:.4f})")
+                    # uq = Q_cam_solver[0] / Q_cam_solver[2] # Q_x / Q_z
+                    # vq = Q_cam_solver[1] / Q_cam_solver[2] # Q_y / Q_z
+                    
+
+
+                    # --- Log Inputs ---
+                    print(f"\n--- Processing Pixel ({u_idx}, {v_idx}) ---")
+                    print(f"[OPTICAL FLOW]:")
+                    print(f"  Model flow: ({flow_u_pix:.4f}, {flow_v_pix:.4f})")
+                    # --- ADDED LOG ---
+                    print(f"  Perfect GT Flow:     ({perfect_flow_u:.4f}, {perfect_flow_v:.4f})")
+                    print(f"[SOLVER INPUTS]:")
+                    print(f"  (up, vp, d): ({up_t1:.4f}, {vp_t1:.4f}, {d_t1:.4f})")
+                    print(f"  (uq, vq):    ({uq:.4f}, {vq:.4f})")
+                    print(f"  Unit radial (SAE) passed: ({vx_r:.4f}, {vy_r:.4f}, {vz_r:.4f})")
+                    print(f"  Radial vel mag passed:    {radial_vel_magnitude:.4f}")
+
+
+                    # --- Solve (Same) ---
+                    t_est_relative = estimate_full_displacement(
+                        dt, T_AB, T_RA,
+                        up_t1, vp_t1, d_t1,
+                        uq, vq,
+                        vx_r, vy_r, vz_r,
+                        radial_vel_magnitude
                     )
-                except:
-                    continue
 
-                u_pix_t1 = px
-                v_pix_t1 = (CAM_H - 1) - py_gl
+                    if t_est_relative is None:
+                         print(f"\n[RESULT]: ✗ Solver failed")
+                         continue
 
-                if not (0 <= u_pix_t1 < CAM_W and 0 <= v_pix_t1 < CAM_H):
-                    continue
+                    # --- Convert Result back to World Frame for Comparison (Same) ---
+                    V_Relative_EST_cam_solver = t_est_relative / dt
+                    V_Absolute_EST_cam_solver = V_Relative_EST_cam_solver + ego_velocity_cam_solver
+                    R_solver_cam_to_world_t1 = np.linalg.inv(R_world_to_solver_cam_t1)
+                    V_Absolute_EST_world = R_solver_cam_to_world_t1 @ V_Absolute_EST_cam_solver
+                    error = V_Absolute_EST_world - obj_vel_world_t1
+                    error_magnitude = np.linalg.norm(error)
+                    velocity_estimates.append(V_Absolute_EST_world)
+                    processed_points += 1
 
-                # Get camera depth
-                cam_pos_gl_homo = np.append(world_pos_t1, 1.0) @ previous_modelview
-                w = cam_pos_gl_homo[3]
-                if abs(w) < 1e-8: continue
-                cam_pos_gl = cam_pos_gl_homo[:3] / w
-                d_t1 = -cam_pos_gl[2]
-                if d_t1 <= 1e-3: continue
-                
-                # Normalized coordinates
-                up_t1 = (u_pix_t1 - cx) / fx
-                vp_t1 = (v_pix_t1 - cy) / fy
+                    # --- Results Logging (Same) ---
+                    print(f"\n[RESULTS]:")
+                    print(f"  Velocity (abs, world):    {V_Absolute_EST_world}")
+                    print(f"  Ground Truth (world):     {obj_vel_world_t1}")
+                    print(f"  Error (world):            {error}")
+                    print(f"  Error magnitude:          {error_magnitude:.6f} m/s")
 
-                # GET OPTICAL FLOW
-                u_idx, v_idx = int(round(u_pix_t1)), int(round(v_pix_t1))
-                if not (0 <= v_idx < CAM_H and 0 <= u_idx < CAM_W):
-                    continue 
-                
-                # Get the PERFECT flow vector from our new GT map
-                pixel_flow_vector = ground_truth_flow_map[v_idx, u_idx]
-                flow_u_pix, flow_v_pix = pixel_flow_vector
-                
-                # Get the model's flow just for logging
-                model_flow_raw = estimated_flow_map_raw[v_idx, u_idx]
-                
-                
-                print(f"\n[OPTICAL FLOW ANALYSIS]:")
-                print(f"  Object velocity (world): {cube2.velocity}")
-                print(f"  Object moving LEFT in world (negative X)")
-                print(f"  → Object is on LEFT of screen, moving towards camera's RIGHT vector, so flow should be POSITIVE u")
-                
-                print(f"\n  Pixel position at t-1: ({u_pix_t1:.2f}, {v_pix_t1:.2f})")
-                
-                print(f"\n  Model flow (RAW): ({model_flow_raw[0]:.4f}, {model_flow_raw[1]:.4f})")
-                print(f"  PERFECT GT Flow:       ({flow_u_pix:.4f}, {flow_v_pix:.4f})")
-                print(f"  → Using PERFECT GT flow for this test.")
-                
-                # Calculate (uq, vq)
-                u_pix_t2 = u_pix_t1 + flow_u_pix
-                v_pix_t2 = v_pix_t1 + flow_v_pix
-                uq = (u_pix_t2 - cx) / fx
-                vq = (v_pix_t2 - cy) / fy
-                
-                print(f"\n[SOLVER INPUTS]:")
-                print(f"  (up, vp, d): ({up_t1:.4f}, {vp_t1:.4f}, {d_t1:.4f})")
-                print(f"  (uq, vq): ({uq:.4f}, {vq:.4f})")
-                print(f"  Unit radial (SAE) passed to solver: ({vx_r:.4f}, {vy_r:.4f}, {vz_r:.4f})")
-                print(f"  Unit radial (camera, for reference): ({unit_radial_camera[0]:.4f}, {unit_radial_camera[1]:.4f}, {unit_radial_camera[2]:.4f})")
-                print(f"  Radial vel magnitude: {radial_vel_magnitude:.4f}")
-                
-                # Solve
-                t_est_relative = estimate_full_displacement(
-                    dt, T_AB, T_RA,
-                    up_t1, vp_t1, d_t1,
-                    uq, vq,
-                    vx_r, vy_r, vz_r,
-                    radial_vel_magnitude
-                )
-                
-                if t_est_relative is None:
-                    print(f"\n[RESULT]: ✗ Solver failed")
-                    continue
-                
-                V_Relative_EST = t_est_relative / dt
-                V_Absolute_EST = V_Relative_EST + EGO_VELOCITY
-                
-                error = V_Absolute_EST - cube2.velocity
-                error_magnitude = np.linalg.norm(error)
-                
-                velocity_estimates.append(V_Absolute_EST)
-                valid_point_count += 1
-                
-                print(f"\n[RESULTS]:")
-                print(f"  Displacement (camera): {t_est_relative}")
-                print(f"  Velocity (absolute):   {V_Absolute_EST}")
-                print(f"  Ground Truth:          {cube2.velocity}")
-                print(f"  Error:                 {error}")
-                print(f"  Error magnitude:       {error_magnitude:.4f} m/s")
-                
-                # Diagnostics
-                print(f"\n[DIAGNOSTICS]:")
-                radial_vel_check = np.dot(V_Relative_EST, unit_radial_camera)
-                print(f"  Radial constraint check:")
-                print(f"    V_rel · unit_radial = {radial_vel_check:.4f}")
-                print(f"    Measured radial     = {radial_vel_magnitude:.4f}")
-                print(f"    Difference:         = {abs(radial_vel_check - radial_vel_magnitude):.4f}")
-                print(f"    Status: {'✓ PASS' if abs(radial_vel_check - radial_vel_magnitude) < 0.5 else '✗ FAIL'}")
 
+                 if processed_points >= 1: break # Break outer loop
+
+
+            # --- Summary (Same) ---
             if len(velocity_estimates) > 0:
                 mean_velocity = np.mean(velocity_estimates, axis=0)
                 median_velocity = np.median(velocity_estimates, axis=0)
-                mean_error = mean_velocity - cube2.velocity
-                median_error = median_velocity - cube2.velocity
+                mean_error = mean_velocity - cube2.velocity # world GT
+                median_error = median_velocity - cube2.velocity # world GT
                 mean_error_mag = np.linalg.norm(mean_error)
                 median_error_mag = np.linalg.norm(median_error)
-                
+
                 print(f"\n{'═'*80}")
-                print(f"SUMMARY")
+                print(f"SUMMARY (Using {processed_points} valid points, inference_cv)")
                 print(f"{'═'*80}")
-                print(f"Ground Truth:    {cube2.velocity}")
-                print(f"Mean Estimate:   {mean_velocity}")
-                print(f"  → Mean Error Mag:  {mean_error_mag:.4f} m/s ({(mean_error_mag / (np.linalg.norm(cube2.velocity) + 1e-9) * 100):.1f}%)")
-                print(f"Median Estimate:   {median_velocity}")
-                print(f"  → Median Error Mag: {median_error_mag:.4f} m/s ({(median_error_mag / (np.linalg.norm(cube2.velocity) + 1e-9) * 100):.1f}%)")
+                print(f"Ground Truth (World): {cube2.velocity}")
+                print(f"Mean Estimate (World):{mean_velocity}")
+                print(f"  → Mean Error Mag:  {mean_error_mag:.6f} m/s ({(mean_error_mag / (np.linalg.norm(cube2.velocity) + 1e-9) * 100):.1f}%)")
+                print(f"Median Estimate (World):{median_velocity}")
+                print(f"  → Median Error Mag: {median_error_mag:.6f} m/s ({(median_error_mag / (np.linalg.norm(cube2.velocity) + 1e-9) * 100):.1f}%)")
                 print(f"{'═'*80}\n")
-                
+
+            # Update flow image using OpenCV's output
             flow_image = flow_to_image(estimated_flow_map_raw)
 
-        # 7. Update State
+
+        # 7. Update State (Same as before)
         previous_image = current_image
         previous_world_pos_map = current_world_pos_map
         previous_id_map = current_id_map
-        previous_radar_points_data = radar_points_data
         previous_modelview = current_modelview
         previous_projection = current_projection
         previous_viewport = current_viewport
 
-        previous_world_pos_map = current_world_pos_map
-        previous_id_map = current_id_map
-        
         frame_count += 1
+
+        if frame_count > 1:
+             print("Pausing after first successful solve. Close window to exit.")
+             # time.sleep(10) # Uncomment to pause automatically
+             break         # Uncomment to exit after first solve
 
     renderer.shutdown()
