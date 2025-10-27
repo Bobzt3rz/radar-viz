@@ -193,3 +193,29 @@ if __name__ == '__main__':
         cam_to_radar_r=np.identity(3) 
     )
     simulate_scene(params3)
+
+    print("\n" + "="*50 + "\n")
+    print("--- SCENARIO 4: REPLICATING MAIN.PY SIMULATION ---")
+
+    # Define the specific rotation from main.py
+    R_RA_main = np.array([
+        [ 0,  0, -1],
+        [-1,  0,  0],
+        [ 0,  1,  0]
+    ])
+
+    # Reconstruct p_a from main.py's first logged frame (t-1 state)
+    d_main = 11.2978
+    up_main = -0.1638
+    vp_main = -0.2311
+    p_a_main = [up_main * d_main, vp_main * d_main, d_main, 1.0]
+
+    params4 = SimulationParams(
+        dt=0.016,                     # From main.py
+        obj_vel=[-1.0, 0.0, 0.0],     # From main.py cube2.velocity
+        ego_vel=[0.0, 0.0, 0.0],      # From main.py EGO_VELOCITY
+        p_a=p_a_main,                 # Reconstructed from main.py logs at t-1
+        cam_to_radar_t=[0.0, 0.0, 0.0], # Based on main.py rig setup
+        cam_to_radar_r=R_RA_main      # From main.py R_RA definition
+    )
+    simulate_scene(params4)
