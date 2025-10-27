@@ -34,15 +34,68 @@ class Camera:
             self.up[0], self.up[1], self.up[2]
         )
 
-    def apply_projection_matrix(self, aspect_ratio: float):
+    def apply_projection_matrix(self, width: int, height: int):
         """
-        Applies the Projection transformation (gluPerspective)
-        based on the camera's intrinsics.
+        Applies the Projection transformation by manually building the
+        matrix from intrinsic parameters, consistent with the blog post:
+        https://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
+
+        Uses the 'y down' convention suitable for top-left image origins.
+
+        Args:
+            width (int): The width of the viewport/image in pixels.
+            height (int): The height of the viewport/image in pixels.
         """
+        # Get intrinsic parameters based on the current viewport dimensions
+        intrinsics = self.get_intrinsics(width, height)
+        fx = intrinsics['fx']
+        fy = intrinsics['fy']
+        cx = intrinsics['cx']
+        cy = intrinsics['cy']
+
+        znear = self.near_clip
+        zfar = self.far_clip
+
+        # Map intrinsics to K matrix elements (assuming K01 skew = 0, x0=y0=0)
+        # K = [[fx,  0, cx],
+        #      [ 0, fy, cy],
+        #      [ 0,  0,  1]]
+        K00 = fx
+        K01 = 0  # Assuming zero skew
+        K02 = cx
+        K11 = fy
+        K12 = cy
+        x0 = 0 # Assuming image origin is 0
+        y0 = 0 # Assuming image origin is 0
+
+        # Build the projection matrix using the 'y down' formula from the blog post
+        P = np.zeros((4, 4), dtype=np.float32)
+
+        P[0, 0] = 2 * K00 / width
+        P[0, 1] = -2 * K01 / width # Skew term (0 here)
+        P[0, 2] = (width - 2 * K02 + 2 * x0) / width
+        P[0, 3] = 0
+
+        P[1, 1] = 2 * K11 / height # Positive for 'y down'
+        P[1, 2] = (-height + 2 * K12 + 2 * y0) / height
+        P[1, 3] = 0
+
+        P[2, 2] = (-zfar - znear) / (zfar - znear) # Z mapping
+        P[2, 3] = -2 * zfar * znear / (zfar - znear)
+
+        P[3, 2] = -1 # Puts Z into W coordinate
+
+        # --- Debug: Print the calculated matrix ---
+        # print("\n--- Manually Calculated Projection Matrix ---")
+        # print(P)
+        # print("-------------------------------------------\n")
+
+        # Set OpenGL matrix mode and load the calculated matrix
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        gluPerspective(self.fov, aspect_ratio, self.near_clip, self.far_clip)
-        
+        # OpenGL expects column-major, so we transpose P before loading
+        glLoadMatrixf(P.T)
+
         # Switch back to ModelView mode for the renderer
         glMatrixMode(GL_MODELVIEW)
 
@@ -60,7 +113,7 @@ class Camera:
 
         # --- 2. Setup Camera's View ---
         glViewport(0, 0, width, height)
-        self.apply_projection_matrix(width / height)
+        self.apply_projection_matrix(width, height)
         self.apply_view_matrix()
 
         # --- 3. Render Solid Faces to Hardware Depth Buffer ---
@@ -110,7 +163,7 @@ class Camera:
 
         # --- 2. Setup Camera's View ---
         glViewport(0, 0, width, height)
-        self.apply_projection_matrix(width / height)
+        self.apply_projection_matrix(width, height)
         self.apply_view_matrix()
 
         # --- 3. Render Solid Faces with ID Colors ---
@@ -166,7 +219,7 @@ class Camera:
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
         
-        self.apply_projection_matrix(width / height)
+        self.apply_projection_matrix(width, height)
         self.apply_view_matrix()
         modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
         projection = glGetDoublev(GL_PROJECTION_MATRIX)

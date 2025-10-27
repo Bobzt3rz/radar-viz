@@ -23,66 +23,11 @@ from modules.utils import (
 
 sys.path.append('..') # Add parent directory to path
 
-WINDOW_WIDTH, WINDOW_HEIGHT = 640, 360
+WINDOW_WIDTH, WINDOW_HEIGHT = 720, 360
 TEXTURE_FILE = "/home/bobberman/programming/radar/radar-viz/simulation/assets/checkerboard.png"
 # TEXTURE_FILE = "/home/bobberman/programming/radar/radar-viz/simulation/assets/optical_flow_texture.png"
 # --- EGO_VELOCITY in OpenGL World Frame ---
 EGO_VELOCITY_WORLD = np.array([0.0, 0.0, 0.0], dtype=float)
-
-def get_intrinsics_from_projection_matrix(projection_matrix: np.ndarray, width: int, height: int) -> dict:
-    """
-    Extracts fx, fy, cx, cy from a standard OpenGL projection matrix
-    created by gluPerspective or similar.
-
-    Assumes standard OpenGL projection matrix layout (column-major order from glGetDoublev).
-    Matrix P = [ P0 P4 P8  P12 ]
-              [ P1 P5 P9  P13 ]
-              [ P2 P6 P10 P14 ]
-              [ P3 P7 P11 P15 ]
-
-    Relationships (approximately, may vary slightly based on matrix construction):
-    fx = P[0] * width / 2
-    fy = P[5] * height / 2
-    cx = (1 - P[8]) * width / 2  (or often just width / 2 if P[8] is near 0)
-    cy = (1 + P[9]) * height / 2 (or often just height / 2 if P[9] is near 0) - Accounts for OpenGL Y flip? Check this.
-    Let's use the simpler center assumption for cx, cy first.
-
-    More robust (from projection matrix elements to K):
-    fx = P[0,0] * width / 2.0
-    fy = P[1,1] * height / 2.0
-    cx = width/2.0  - P[0,2]*width/2.0   # P[0,2] = (cx - width/2) / (width/2) --> Check derivation
-    cy = height/2.0 - P[1,2]*height/2.0  # P[1,2] = (cy - height/2) / (height/2) --> Check derivation
-
-    Let's use the simplest version assuming center principal point:
-    fx = ProjMat[0,0] * width / 2.0
-    fy = ProjMat[1,1] * height / 2.0
-    cx = width / 2.0
-    cy = height / 2.0
-    """
-    # glGetDoublev returns column-major, reshape transposes to row-major
-    ProjMat = projection_matrix.reshape(4, 4).T
-
-    fx = ProjMat[0, 0] * width / 2.0
-    fy = ProjMat[1, 1] * height / 2.0 # Check sign convention for fy
-    cx = width / 2.0
-    cy = height / 2.0 # Assuming principal point at center
-
-    # Let's verify fy calculation using relation to near/far and fov
-    # P[1,1] = cot(fov_y / 2)
-    # fy_alt = (height / 2.0) * ProjMat[1, 1] # Check if this matches fy from FOV
-    # fov_y_rad = np.arctan(1.0 / ProjMat[1,1]) * 2.0
-    # fy_alt2 = (height / 2.0) / np.tan(fov_y_rad / 2.0)
-
-    # Need to be careful about OpenGL's NDC Y direction vs image Y direction.
-    # Often fy extracted needs negation depending on convention.
-    # Let's assume the calculation from FOV in camera.py is the reference for now.
-
-    print(f"  [Intrinsics Debug] From Proj Mat: fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
-
-    # Return values consistent with get_intrinsics calculation method for now
-    # We will just use this function to *compare* values
-    # return {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
-    return {'fx': fx, 'fy': abs(fy), 'cx': cx, 'cy': cy} # Let's try abs(fy) as projection matrix might have negative element
 
 if __name__ == "__main__":
     # 1. Simulation Setup (Same as before)
@@ -240,26 +185,6 @@ if __name__ == "__main__":
                     # --- GET PERFECT GT FLOW (for comparison) ---
                     perfect_flow_vector = ground_truth_flow_map[v_idx, u_idx]
                     perfect_flow_u, perfect_flow_v = perfect_flow_vector
-
-
-                    # TODO: TESTING INTRINSICS
-                    # --- Calculate (uq, vq) using ESTIMATED flow ---
-                    # --- Get Intrinsics using BOTH methods ---
-                    print("\n[INTRINSICS CALCULATION]:")
-                    # Method 1: From Camera FOV
-                    intrinsics_fov = rig.get_camera().get_intrinsics(CAM_W, CAM_H)
-                    fx_fov, fy_fov, cx_fov, cy_fov = intrinsics_fov['fx'], intrinsics_fov['fy'], intrinsics_fov['cx'], intrinsics_fov['cy']
-                    print(f"  From FOV        : fx={fx_fov:.4f}, fy={fy_fov:.4f}, cx={cx_fov:.4f}, cy={cy_fov:.4f}")
-
-                    # Method 2: From previous frame's Projection Matrix
-                    intrinsics_proj = get_intrinsics_from_projection_matrix(previous_projection, CAM_W, CAM_H)
-                    fx_proj, fy_proj, cx_proj, cy_proj = intrinsics_proj['fx'], intrinsics_proj['fy'], intrinsics_proj['cx'], intrinsics_proj['cy']
-                    print(f"  From Projection        : fx={fx_proj:.4f}, fy={fy_proj:.4f}, cx={cx_proj:.4f}, cy={cy_proj:.4f}")
-                    # Values printed inside the helper function
-
-                    # --- USE INTRINSICS FROM FOV METHOD for consistency with setup ---
-                    fx, fy, cx, cy = fx_proj, fy_proj, cx_proj, cy_proj
-                    print(f"  Using Projection-based intrinsics for solver.")
 
 
                     u_pix_t1 = u_idx # Pixel index at t-1
