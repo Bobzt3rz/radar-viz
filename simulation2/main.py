@@ -6,7 +6,7 @@ from typing import List
 from modules.velocity_solver import solve_full_velocity
 from modules.world import World
 from modules.camera import Camera
-from modules.radar import Radar, visualize_radar_points
+from modules.radar import Radar, visualize_radar_points, save_radar_point_cloud_ply
 from modules.cube import Cube
 from modules.renderer import Renderer
 from modules.optical_flow import OpticalFlow
@@ -18,7 +18,7 @@ if __name__ == "__main__":
 
     # Add entities BEFORE creating the renderer
     camera = Camera(
-        position=np.array([0.0, 0.0, 0.0]), velocity=np.array([0.0, 0.0, 0.5]),
+        position=np.array([0.0, 0.0, 0.0]), velocity=np.array([0.0, 0.0, 0.0]),
         # Adjust cx, cy if Y-down origin was used during calibration
         fx=800.0, fy=800.0, cx=1280/2, cy=720/2, image_width=1280, image_height=720
     )
@@ -37,14 +37,14 @@ if __name__ == "__main__":
     ], dtype=np.float32)
     target_cube = Cube(
         position=np.array([0.0, 0.4, 3.0]), # Closer
-        velocity=np.array([1.0, -1.5, 0.5]), # Slower
+        velocity=np.array([1.0, -1.5, -1.0]), # Slower
         rotation=rotation_matrix,
         size=0.5
     )
     static_cube = Cube(
-        position=np.array([-2.0, -1.0, 7.0]),
-        velocity=np.array([0.05, 0.0, 0.0]),
-        size=1.0
+        position=np.array([-1.5, -0.5, 3.0]),
+        velocity=np.array([0.01, 0.0, 0.0]),
+        size=0.5
     )
 
     world.add_entity(camera)
@@ -94,9 +94,10 @@ if __name__ == "__main__":
 
         current_frame_rgb = renderer.capture_frame()
 
-        save_image(current_frame_rgb, f"output/frame_{frame_count:04d}.png")
+        save_image(current_frame_rgb, f"output/camera/{frame_count:04d}.png")
 
         if radar_detections:
+            save_radar_point_cloud_ply(radar_detections, f"output/radar_cloud/{frame_count:04d}.ply")
             radar_image = visualize_radar_points(
                 detections=radar_detections,
                 radar_fov_az_rad=radar.fov_azimuth_rad,
@@ -107,7 +108,7 @@ if __name__ == "__main__":
             )
             # Save the radar visualization
             save_image(cv2.cvtColor(radar_image, cv2.COLOR_BGR2RGB), # Convert BGR to RGB for Pillow
-                       f"output/radar_frame_{frame_count:04d}.png")
+                       f"output/radar_image/{frame_count:04d}.png")
 
         flow = optical_flow_calculator.inference(current_frame_rgb)
 
@@ -163,7 +164,7 @@ if __name__ == "__main__":
 
                  # Pixel coords (t+delta_t) - careful with int conversion if needed early
                  xq_pix_f = camera.fx * uq + camera.cx
-                 yq_pix_f = camera.fy * -1 * vq + camera.cy
+                 yq_pix_f = camera.fy * vq + camera.cy
                  xq_pix = int(round(xq_pix_f))
                  yq_pix = int(round(yq_pix_f))
                  # print(f"xq_pix: {xq_pix}, yq_pix: {yq_pix}")
@@ -181,7 +182,7 @@ if __name__ == "__main__":
 
                  # Normalized coords (t)
                  up = (xp_pix_f - camera.cx) / camera.fx
-                 vp = -(yp_pix_f - camera.cy) / camera.fy
+                 vp = (yp_pix_f - camera.cy) / camera.fy
                  # print(f"up: {up}, vp: {vp}")
 
                  # --- Call the solver ---

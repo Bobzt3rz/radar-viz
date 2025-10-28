@@ -1,6 +1,8 @@
 import numpy as np
 import cv2
 from typing import List, Tuple, Optional
+import math
+import os
 
 from .entity import Entity
 from .world import World
@@ -276,3 +278,110 @@ def visualize_radar_points(
             cv2.circle(image, (pixel_x, pixel_y), radius=2, color=color, thickness=-1) # Filled circle
 
     return image
+
+def cartesian_to_spherical_radar(x: float, y: float, z: float) -> Tuple[float, float, float]:
+    """
+    Converts Cartesian radar coordinates (X-right, Y-down, Z-forward)
+    to Spherical coordinates (range, azimuth, elevation).
+
+    Args:
+        x, y, z: Cartesian coordinates in radar frame.
+
+    Returns:
+        Tuple (range, azimuth_rad, elevation_rad).
+        - range: Distance from origin.
+        - azimuth: Angle from Z-axis in the XZ plane (positive towards +X). Radians.
+        - elevation: Angle from the XZ plane (positive towards +Y, which is down). Radians.
+    """
+    range_dist = math.sqrt(x**2 + y**2 + z**2)
+    if range_dist < 1e-6: # Avoid division by zero at origin
+        return 0.0, 0.0, 0.0
+
+    # Azimuth: angle in XZ plane from Z axis
+    azimuth_rad = math.atan2(x, z)
+
+    # Elevation: angle from the XZ plane
+    # If z is near zero but x is not, atan2 handles it for azimuth.
+    # For elevation, arcsin(y/range) is generally robust.
+    elevation_rad = math.asin(y / range_dist) # asin domain is [-1, 1]
+
+    return range_dist, azimuth_rad, elevation_rad
+
+def save_radar_point_cloud_ply(
+    detections: List[Tuple[Vector3, float, Entity]], # Ray casting output format
+    file_path: str
+) -> bool:
+    """
+    Saves radar detections to a PLY file with specified fields.
+
+    Args:
+        detections: List of tuples (point_radar_coords, speed_radial, entity).
+        file_path: Full path for the output PLY file.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    if not isinstance(file_path, str) or not file_path:
+        print("Error: Invalid file path for PLY.")
+        return False
+    if not detections:
+        print(f"Warning: No radar detections to save to {file_path}.")
+        # Optionally create an empty PLY file
+        try:
+            directory = os.path.dirname(file_path)
+            if directory: os.makedirs(directory, exist_ok=True)
+            with open(file_path, 'w') as f:
+                f.write("ply\n")
+                f.write("format ascii 1.0\n")
+                f.write("element vertex 0\n")
+                f.write("property float x\n")
+                f.write("property float y\n")
+                f.write("property float z\n")
+                f.write("property float azimuth\n")
+                f.write("property float elevation\n")
+                f.write("property float range\n")
+                f.write("property float radial_velocity\n")
+                f.write("end_header\n")
+            return True
+        except Exception as e:
+            print(f"Error creating empty PLY file {file_path}: {e}")
+            return False
+
+
+    num_points = len(detections)
+
+    # --- Prepare PLY Header ---
+    header = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {num_points}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float azimuth",    # In radians
+        "property float elevation",   # In radians
+        "property float range",
+        "property float radial_velocity",
+        "end_header"
+    ]
+
+    # --- Prepare Data Lines ---
+    data_lines = []
+    for point_rad, speed_rad, entity in detections:
+        x, y, z = point_rad
+        range_val, az_rad, el_rad = cartesian_to_spherical_radar(x, y, z)
+        # Format: x y z azimuth elevation range radial_velocity
+        data_lines.append(f"{x:.6f} {y:.6f} {z:.6f} {az_rad:.6f} {el_rad:.6f} {range_val:.6f} {speed_rad:.6f}")
+
+    # --- Write to File ---
+    try:
+        directory = os.path.dirname(file_path)
+        if directory: os.makedirs(directory, exist_ok=True)
+
+        with open(file_path, 'w') as f:
+            f.write("\n".join(header) + "\n")
+            f.write("\n".join(data_lines) + "\n")
+        return True
+    except Exception as e:
+        print(f"Error writing PLY file {file_path}: {e}")
+        return False

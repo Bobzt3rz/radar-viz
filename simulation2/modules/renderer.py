@@ -93,7 +93,7 @@ class Renderer:
         self.texture_loc = glGetUniformLocation(self.shader, "texture1") # <-- Get texture uniform location
 
         # --- OpenGL Coordinate System Conversion ---
-        self.gl_conv: Matrix4x4 = np.diag([1,-1,-1,1]).astype(np.float32)
+        self.gl_conv: Matrix4x4 = np.diag([1,1,-1,1]).astype(np.float32)
 
         # --- Load Texture ---
         self.textures = {} # Store texture IDs, maybe one per cube later
@@ -184,7 +184,8 @@ class Renderer:
     def render_scene(self, near=0.1, far=100.0):
         cam = self.world.camera; assert cam is not None
         glClear(int(GL_COLOR_BUFFER_BIT)| int(GL_DEPTH_BUFFER_BIT))
-        view = self.gl_conv @ cam.get_pose_world_to_local(); proj = cam.get_opengl_projection_matrix(near, far)
+        view = self.gl_conv @ cam.get_pose_world_to_local()
+        proj = cam.get_opengl_projection_matrix(near, far)
 
         glUseProgram(self.shader)
 
