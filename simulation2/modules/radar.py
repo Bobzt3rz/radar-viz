@@ -1,10 +1,72 @@
 import numpy as np
-from typing import List, Tuple
+import cv2
+from typing import List, Tuple, Optional
 
 from .entity import Entity
 from .world import World
 from .cube import Cube
 from .types import Vector3, Matrix3x3
+
+def ray_cube_intersection(ray_origin_world: Vector3,
+                          ray_direction_world: Vector3,
+                          cube: Cube) -> Optional[float]:
+    """
+    Checks for intersection between a ray and a cube using the Slab method.
+    Transforms the ray into the cube's local coordinate system.
+
+    Returns:
+        The distance 't' along the ray to the intersection point,
+        or None if no intersection occurs within the cube.
+    """
+    # Transform ray into cube's local coordinate system
+    M_world_to_local = cube.get_pose_world_to_local()
+    ray_origin_local_h = M_world_to_local @ np.append(ray_origin_world, 1.0)
+    ray_origin_local = ray_origin_local_h[:3] / ray_origin_local_h[3] # Ensure proper perspective division if M includes perspective
+
+    # Transform direction vector (only rotation part)
+    R_world_to_local = M_world_to_local[0:3, 0:3]
+    ray_direction_local = R_world_to_local @ ray_direction_world
+    # Renormalize direction vector after rotation if scaling was involved (unlikely here)
+    # ray_direction_local /= np.linalg.norm(ray_direction_local) # Usually not needed if R is pure rotation
+
+    # Slab method for Axis-Aligned Bounding Box (AABB) intersection
+    # Cube in local coords is centered at origin, extends -s to +s
+    s = cube.size / 2.0
+    min_bounds = np.array([-s, -s, -s], dtype=np.float32)
+    max_bounds = np.array([ s,  s,  s], dtype=np.float32)
+
+    t_min = 0.0 # Start of the ray segment
+    t_max = np.inf # End of the ray segment (we check max_range later)
+
+    for i in range(3): # Iterate over x, y, z axes
+        if abs(ray_direction_local[i]) < 1e-6: # Ray parallel to slab i
+            # If origin is outside the slab, no intersection
+            if ray_origin_local[i] < min_bounds[i] or ray_origin_local[i] > max_bounds[i]:
+                return None
+        else:
+            # Calculate intersection distances with slab planes
+            t1 = (min_bounds[i] - ray_origin_local[i]) / ray_direction_local[i]
+            t2 = (max_bounds[i] - ray_origin_local[i]) / ray_direction_local[i]
+
+            # Ensure t1 is intersection with near plane, t2 with far plane
+            if t1 > t2:
+                t1, t2 = t2, t1
+
+            # Update overall intersection interval [t_min, t_max]
+            t_min = max(t_min, t1)
+            t_max = min(t_max, t2)
+
+            # If interval becomes invalid, no intersection
+            if t_min > t_max:
+                return None
+
+    # If t_min is positive and finite, there is an intersection at distance t_min
+    if t_min >= 0 and t_min != np.inf:
+         # Check if t_max is also valid (ray exits cube)
+         if t_max >= t_min:
+              return t_min # Return distance to entry point
+
+    return None # No valid intersection
 
 class Radar(Entity):
     """ Simulates a radar sensor detecting cube corners. """
@@ -14,78 +76,203 @@ class Radar(Entity):
                  rotation: Matrix3x3 = np.eye(3),
                  fov_azimuth_deg: float = 60.0,
                  fov_elevation_deg: float = 30.0,
-                 max_range: float = 100.0):
+                 max_range: float = 100.0,
+                 num_rays_azimuth: int = 64, # Number of horizontal rays
+                 num_rays_elevation: int = 32 # Number of vertical rays
+                 ):
         super().__init__(position, velocity, rotation)
         self.fov_azimuth_rad = np.radians(fov_azimuth_deg)
         self.fov_elevation_rad = np.radians(fov_elevation_deg)
         self.max_range = max_range
+        self.num_rays_azimuth = num_rays_azimuth
+        self.num_rays_elevation = num_rays_elevation
         # Radar local axes (Z forward, Y down, X right)
         self.axis_forward = np.array([0, 0, 1], dtype=np.float32)
         # Assuming Y-down convention for radar matching camera/world
         self.axis_up = np.array([0, -1, 0], dtype=np.float32)
         self.axis_right = np.array([1, 0, 0], dtype=np.float32)
 
-    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Cube, int]]:
+    def _generate_ray_directions_local(self) -> np.ndarray:
+        """ Generates a grid of unit direction vectors in local radar coords. """
+        azimuths = np.linspace(-self.fov_azimuth_rad / 2.0,
+                               self.fov_azimuth_rad / 2.0,
+                               self.num_rays_azimuth, dtype=np.float32)
+        elevations = np.linspace(-self.fov_elevation_rad / 2.0,
+                                 self.fov_elevation_rad / 2.0,
+                                 self.num_rays_elevation, dtype=np.float32)
+
+        directions = []
+        # Create rays pointing generally along +Z (forward)
+        for el in elevations:
+            for az in azimuths:
+                # Spherical to Cartesian conversion (assuming Z forward, Y down, X right)
+                # Adjust if your local radar convention differs
+                x = np.sin(az) * np.cos(el)
+                y = np.sin(el) # Y is elevation angle from XZ plane
+                z = np.cos(az) * np.cos(el) # Should be positive for forward
+                
+                # Check convention: Y = sin(el) assumes Y is up relative to horizon?
+                # If Y is down: y = -sin(el)? Let's stick to standard Y-up spherical
+                # then apply simulation's Y-down convention later if needed, OR adjust here.
+                # Assuming standard math convention first: Z-fwd, Y-up, X-right for angles
+                
+                # Re-deriving for Z-fwd, Y-down, X-right:
+                # Azimuth 'az' is angle from Z-axis in XZ plane (positive towards +X)
+                # Elevation 'el' is angle from XZ plane (positive towards +Y, which is DOWN)
+                x = np.sin(az) * np.cos(el)
+                y = np.sin(el) # Positive elevation = positive Y = Down
+                z = np.cos(az) * np.cos(el) # Forward
+                
+                direction = np.array([x, y, z], dtype=np.float32)
+                # Normalize (should be close to 1 already)
+                norm = np.linalg.norm(direction)
+                if norm > 1e-6:
+                    directions.append(direction / norm)
+                else: # Handle center case
+                    directions.append(np.array([0,0,1], dtype=np.float32))
+
+
+        return np.array(directions, dtype=np.float32) # Shape: (N_rays, 3)
+
+    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Entity]]:
         """
-        Generates radar detections by checking cube corners.
-        Returns: [(point_pos_radar_coords, speed_radial, source_entity, corner_index), ...]
+        Generates radar detections using dense ray casting.
+        Returns: [(point_pos_radar_coords, speed_radial, hit_entity), ...]
+        (Removed corner_idx, as we hit a surface point now)
         """
-        # <<<<<<<<<<<< MODIFIED OUTPUT LIST TYPE >>>>>>>>>>>>>>
-        point_cloud: List[Tuple[Vector3, float, Cube, int]] = []
+        point_cloud: List[Tuple[Vector3, float, Entity]] = []
 
         radar_origin_world = self.position
         M_world_to_radar = self.get_pose_world_to_local()
-        R_world_to_radar = M_world_to_radar[0:3, 0:3]
+        M_radar_to_world = self.get_pose_local_to_world()
+        R_radar_to_world = M_radar_to_world[0:3, 0:3] # Rotation part only for directions
 
-        potential_targets = [e for e in world.entities if isinstance(e, Cube) and e is not self and np.sum((e.position - radar_origin_world)**2) < (self.max_range + e.size * 1.74)**2]
+        local_ray_directions = self._generate_ray_directions_local()
 
-        seen_directions = [] # Stores (direction_vector, distance) for occlusion
+        cubes_in_world = [e for e in world.entities if isinstance(e, Cube) and e is not self]
 
-        for entity in potential_targets:
-            # Type hint for clarity
-            if not isinstance(entity, Cube): continue # Should already be filtered, but safe check
+        for local_dir in local_ray_directions:
+            # Transform ray direction to world coordinates
+            ray_dir_world = R_radar_to_world @ local_dir
 
-            M_cube_local_to_world = entity.get_pose_local_to_world()
-            local_vertices = entity.get_local_vertices()
-            cube_vel_world = entity.velocity
+            closest_hit_distance = self.max_range
+            closest_hit_entity = None
 
-            # <<<<<<<<<<<< USE ENUMERATE TO GET INDEX >>>>>>>>>>>>>>
-            for corner_idx, local_vert in enumerate(local_vertices):
-                # --- 1. Get Corner Position in World ---
-                target_point_world = (M_cube_local_to_world @ np.append(local_vert, 1.0))[0:3]
+            # --- Test intersection with all cubes ---
+            for cube in cubes_in_world:
+                intersection_distance = ray_cube_intersection(radar_origin_world, ray_dir_world, cube)
 
-                # --- 2. Vector from Radar to Corner (World Coords) & Range Check ---
-                radar_to_target_world = target_point_world - radar_origin_world
-                distance = np.linalg.norm(radar_to_target_world)
-                if distance < 1e-6 or distance > self.max_range: continue
+                if intersection_distance is not None and intersection_distance < closest_hit_distance:
+                     # Check distance again to be sure (intersection func returns local dist)
+                     # Need world distance - calculate hit point
+                     hit_point_world = radar_origin_world + ray_dir_world * intersection_distance
+                     actual_distance = np.linalg.norm(hit_point_world - radar_origin_world)
+                     
+                     if actual_distance < closest_hit_distance: # Compare world distances
+                         closest_hit_distance = actual_distance
+                         closest_hit_entity = cube
 
-                # --- 3. Transform Vector to Radar Coords & Check FoV ---
-                radar_to_target_radar = R_world_to_radar @ radar_to_target_world
-                if abs(np.arctan2(radar_to_target_radar[0], radar_to_target_radar[2])) > self.fov_azimuth_rad / 2.0: continue
-                if abs(np.arctan2(radar_to_target_radar[1], radar_to_target_radar[2])) > self.fov_elevation_rad / 2.0: continue
 
-                # --- 4. Basic Occlusion Check ---
-                current_direction = radar_to_target_world / distance
-                is_occluded = False
-                temp_seen_indices_to_remove = []
-                for i in range(len(seen_directions)):
-                    seen_dir, seen_dist = seen_directions[i]
-                    if np.dot(current_direction, seen_dir) > 0.995: # Similar direction tolerance
-                        if distance > seen_dist + 1e-4: is_occluded = True; break
-                        elif distance < seen_dist - 1e-4: temp_seen_indices_to_remove.append(i)
-                if is_occluded: continue
-                if temp_seen_indices_to_remove:
-                    for idx in sorted(temp_seen_indices_to_remove, reverse=True): del seen_directions[idx]
+            # --- If a hit was found within range ---
+            if closest_hit_entity is not None:
+                # Calculate the exact hit point in world coordinates
+                hit_point_world = radar_origin_world + ray_dir_world * closest_hit_distance
 
-                # --- 5. Calculate Radial Velocity ---
-                speed_radial = np.dot(cube_vel_world, current_direction)
+                # Transform hit point to radar coordinates
+                hit_point_world_h = np.append(hit_point_world, 1.0)
+                hit_point_radar_h = M_world_to_radar @ hit_point_world_h
+                hit_point_radar = hit_point_radar_h[:3]
 
-                # --- 6. Position in Radar Coordinates ---
-                point_pos_radar = (M_world_to_radar @ np.append(target_point_world, 1.0))[0:3]
+                # Calculate radial velocity
+                hit_entity_vel_world = closest_hit_entity.velocity
+                los_unit_vec_world = ray_dir_world # Direction is already normalized unit vector
+                speed_radial = np.dot(hit_entity_vel_world, los_unit_vec_world)
 
-                # --- 7. Add to Point Cloud & Track Occlusion ---
-                # <<<<<<<<<<<< INCLUDE ENTITY AND INDEX IN OUTPUT TUPLE >>>>>>>>>>>>>>
-                point_cloud.append((point_pos_radar, speed_radial, entity, corner_idx))
-                seen_directions.append((current_direction, distance))
+                point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity))
 
         return point_cloud
+    
+def visualize_radar_points(
+    detections: List[Tuple[Vector3, float, Entity]], # Assuming ray casting output
+    radar_fov_az_rad: float,
+    radar_fov_el_rad: float,
+    output_width: int,
+    output_height: int,
+    color_map_range: Optional[Tuple[float, float]] = (-10.0, 10.0) # Speed range for color
+) -> np.ndarray:
+    """
+    Projects radar points onto a 2D image plane based on radar FoV.
+
+    Args:
+        detections: List of tuples (point_radar_coords, speed_radial, entity).
+        radar_fov_az_rad: Horizontal field of view in radians.
+        radar_fov_el_rad: Vertical field of view in radians.
+        output_width: Width of the output visualization image.
+        output_height: Height of the output visualization image.
+        color_map_range: Tuple (min_speed, max_speed) for color mapping radial velocity.
+                         Set to None to draw all points in white.
+
+    Returns:
+        A NumPy array (HxWx3 BGR uint8) representing the visualization.
+    """
+    # Create a blank black image (BGR format for OpenCV)
+    image = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+
+    # Calculate scaling factors based on FoV for perspective projection
+    # tan(FoV/2) relates the half-dimension at distance z=1
+    max_u_at_z1 = np.tan(radar_fov_az_rad / 2.0)
+    max_v_at_z1 = np.tan(radar_fov_el_rad / 2.0)
+
+    # Avoid division by zero if FoV is extremely small
+    scale_x = (output_width / 2.0) / max_u_at_z1 if max_u_at_z1 > 1e-6 else output_width
+    scale_y = (output_height / 2.0) / max_v_at_z1 if max_v_at_z1 > 1e-6 else output_height
+
+    center_x = output_width / 2.0
+    center_y = output_height / 2.0
+
+    # Prepare colormap if needed
+    cmap = cv2.COLORMAP_JET # Or COLORMAP_VIRIDIS, etc.
+    min_speed, max_speed = 0, 1 # Default values
+    use_color = color_map_range is not None
+    if use_color and color_map_range:
+        min_speed, max_speed = color_map_range
+        speed_range = max_speed - min_speed
+        if speed_range <= 0: speed_range = 1.0 # Avoid division by zero
+
+
+    for point_rad, speed_rad, entity in detections:
+        x, y, z = point_rad
+
+        # Ensure point is in front of the radar
+        if z <= 1e-3: # Use a small epsilon
+            continue
+
+        # Perspective projection to normalized coords (relative to FoV at z=1)
+        u_norm = x / z
+        v_norm = y / z # Positive V means DOWN in radar space
+
+        # Map normalized coords to pixel coords
+        # Points at +/- max_u_at_z1 should map to 0 or width
+        # Points at +/- max_v_at_z1 should map to 0 or height
+        pixel_x = int(round(center_x + u_norm * scale_x))
+        # Negate v_norm's contribution to map Y-down radar space to Y-up visualization effect
+        pixel_y = int(round(center_y - v_norm * scale_y))
+
+
+        # Check if point is within image bounds
+        if 0 <= pixel_x < output_width and 0 <= pixel_y < output_height:
+            # Determine color
+            color = (255, 255, 255) # Default: White (BGR)
+            if use_color:
+                # Normalize speed to 0-1 range
+                norm_speed = (speed_rad - min_speed) / speed_range # type: ignore
+                norm_speed_clipped = np.clip(norm_speed, 0.0, 1.0)
+                # Map to colormap (expects value 0-255)
+                color_idx = int(norm_speed_clipped * 255)
+                # Apply colormap (returns BGR)
+                color = cv2.applyColorMap(np.array([[color_idx]], dtype=np.uint8), cmap)[0][0].tolist()
+
+            # Draw a small circle for the point
+            cv2.circle(image, (pixel_x, pixel_y), radius=2, color=color, thickness=-1) # Filled circle
+
+    return image
