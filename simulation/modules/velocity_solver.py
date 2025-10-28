@@ -77,9 +77,11 @@ def calculate_3d_velocity(
     d_t2_est = d_t1 + (radial_vel_magnitude * dt)
     if d_t2_est == 0: return None
         
+    # print(f"d_t1: {d_t1}, d_t2_est: {d_t2_est}")
+
     # c) Un-project T2 pixel to get normalized (uq, vq)
-    uq = (u_pix_t2 - cx) * d_t2_est / fx
-    vq = (v_pix_t2 - cy) * d_t2_est / fy
+    uq = u_pix_t2
+    vq = v_pix_t2
     
     # 3. Solve!
     t_est_relative = estimate_full_displacement(

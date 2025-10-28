@@ -74,10 +74,7 @@ class OpenGLRenderer:
         # This tells OpenGL to render into this specific rectangle
         glViewport(x, y, width, height)
         
-        # 2. --- Setup Projection Matrix (from Camera Intrinsics) ---
-        # Aspect ratio must be based on the viewport, not the window
-        aspect_ratio = width / height
-        camera.apply_projection_matrix(aspect_ratio)
+        camera.apply_projection_matrix(width, height)
 
         # 3. --- Setup View Matrix (from Camera Extrinsics) ---
         camera.apply_view_matrix()
