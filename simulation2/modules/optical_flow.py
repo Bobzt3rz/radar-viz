@@ -131,7 +131,7 @@ class OpticalFlow:
         # Convert to tensor, permute to (C, H, W), and convert to float
         return torch.from_numpy(img.copy()).permute(2, 0, 1).float()
 
-    def calculate_flow(self, current_frame_bgr: NDArray[np.uint8]) -> Optional[FlowField]:
+    def inference_cv(self, current_frame_rgb: NDArray[np.uint8]) -> Optional[FlowField]:
         """
         Calculates dense optical flow between the previous frame and the current frame.
 
@@ -149,7 +149,7 @@ class OpticalFlow:
         """
         # 1. Convert current frame to grayscale
         #    OpenCV typically works best with grayscale for flow
-        current_gray = cv2.cvtColor(current_frame_bgr, cv2.COLOR_BGR2GRAY)
+        current_gray = cv2.cvtColor(current_frame_rgb, cv2.COLOR_RGB2GRAY)
 
         flow: Optional[FlowField] = None
 

@@ -136,13 +136,12 @@ class Radar(Entity):
 
         return np.array(directions, dtype=np.float32) # Shape: (N_rays, 3)
 
-    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Entity]]:
+    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Optional[Entity], bool]]:
         """
         Generates radar detections using dense ray casting.
-        Returns: [(point_pos_radar_coords, speed_radial, hit_entity), ...]
-        (Removed corner_idx, as we hit a surface point now)
+        Returns: [(point_pos_radar_coords, speed_radial, hit_entity, isNoise), ...]
         """
-        point_cloud: List[Tuple[Vector3, float, Entity]] = []
+        point_cloud: List[Tuple[Vector3, float, Optional[Entity], bool]] = []
 
         radar_origin_world = self.position
         M_world_to_radar = self.get_pose_world_to_local()
@@ -190,12 +189,32 @@ class Radar(Entity):
                 los_unit_vec_world = ray_dir_world # Direction is already normalized unit vector
                 speed_radial = np.dot(hit_entity_vel_world, los_unit_vec_world)
 
-                point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity))
+                point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity, False))
+
+        # --- 4. GENERATE CLUTTER (FALSE POSITIVES) ---
+        # You can make this a random number, e.g., np.random.poisson(3)
+        num_clutter_points = 200 
+        
+        azimuth_fov = self.fov_azimuth_rad
+        elevation_fov = self.fov_elevation_rad
+        
+        for _ in range(num_clutter_points):
+            # Generate a random point within the radar's FoV and range
+            clutter_r = np.random.uniform(1.0, self.max_range) # 1.0 = min range
+            clutter_az = np.random.uniform(-azimuth_fov / 2.0, azimuth_fov / 2.0)
+            clutter_el = np.random.uniform(-elevation_fov / 2.0, elevation_fov / 2.0)
+            
+            clutter_point_radar = spherical_to_cartesian(clutter_r, clutter_az, clutter_el)
+            
+            # Give it a random radial velocity
+            clutter_speed = np.random.uniform(-3.0, 3.0) # e.g., +/- 1 m/s
+            
+            point_cloud.append((clutter_point_radar, clutter_speed, None, True)) # isNoise = True
 
         return point_cloud
     
 def visualize_radar_points(
-    detections: List[Tuple[Vector3, float, Entity]], # Assuming ray casting output
+    detections: List[Tuple[Vector3, float, Optional[Entity], bool]], # Assuming ray casting output
     radar_fov_az_rad: float,
     radar_fov_el_rad: float,
     output_width: int,
@@ -242,7 +261,7 @@ def visualize_radar_points(
         if speed_range <= 0: speed_range = 1.0 # Avoid division by zero
 
 
-    for point_rad, speed_rad, entity in detections:
+    for point_rad, speed_rad, entity, isNoise in detections:
         x, y, z = point_rad
 
         # Ensure point is in front of the radar
@@ -307,8 +326,23 @@ def cartesian_to_spherical_radar(x: float, y: float, z: float) -> Tuple[float, f
 
     return range_dist, azimuth_rad, elevation_rad
 
+def spherical_to_cartesian(r: float, az: float, el: float) -> Vector3:
+    """
+    Converts Radar Spherical (range, azimuth, elevation) to 
+    Radar Cartesian (X-right, Y-down, Z-forward).
+
+    - az: Azimuth from Z-axis in XZ plane (positive to +X).
+    - el: Elevation from XZ plane (positive to +Y, which is down).
+    """
+    # Calculate the components based on the correct definitions
+    x = r * np.cos(el) * np.sin(az)
+    y = r * np.sin(el)
+    z = r * np.cos(el) * np.cos(az)
+    
+    return np.array([x, y, z])
+
 def save_radar_point_cloud_ply(
-    detections: List[Tuple[Vector3, float, Entity]], # Ray casting output format
+    detections: List[Tuple[Vector3, float, Optional[Entity], bool]], # Ray casting output format
     file_path: str
 ) -> bool:
     """
@@ -367,7 +401,7 @@ def save_radar_point_cloud_ply(
 
     # --- Prepare Data Lines ---
     data_lines = []
-    for point_rad, speed_rad, entity in detections:
+    for point_rad, speed_rad, entity, isNoise in detections:
         x, y, z = point_rad
         range_val, az_rad, el_rad = cartesian_to_spherical_radar(x, y, z)
         # Format: x y z azimuth elevation range radial_velocity

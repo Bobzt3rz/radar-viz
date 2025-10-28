@@ -3,10 +3,9 @@ import numpy as np
 import cv2
 from typing import List
 
-from modules.velocity_solver import solve_full_velocity
-from modules.world import World
-from modules.camera import Camera
-from modules.radar import Radar, visualize_radar_points, save_radar_point_cloud_ply
+from modules.velocity_solver import estimate_velocities_for_frame
+from modules.setup import setup_simulation
+from modules.radar import visualize_radar_points, save_radar_point_cloud_ply
 from modules.cube import Cube
 from modules.renderer import Renderer
 from modules.optical_flow import OpticalFlow
@@ -14,43 +13,7 @@ from modules.utils import save_image
 
 if __name__ == "__main__":
 
-    world = World(delta_t=1/60.0)
-
-    # Add entities BEFORE creating the renderer
-    camera = Camera(
-        position=np.array([0.0, 0.0, 0.0]), velocity=np.array([0.0, 0.0, 0.0]),
-        # Adjust cx, cy if Y-down origin was used during calibration
-        fx=800.0, fy=800.0, cx=1280/2, cy=720/2, image_width=1280, image_height=720
-    )
-    radar = Radar(
-        position=np.array([0.0, 0.0, 0.0]),
-        velocity=np.array([0.0, 0.0, 0.5]),
-        fov_azimuth_deg=90, fov_elevation_deg=40, max_range=100
-    )
-    angle_radians = np.radians(45)
-    cos_a = np.cos(angle_radians)
-    sin_a = np.sin(angle_radians)
-    rotation_matrix = np.array([
-        [ cos_a,  0,  sin_a],
-        [     0,  1,      0],
-        [-sin_a,  0,  cos_a]
-    ], dtype=np.float32)
-    target_cube = Cube(
-        position=np.array([0.0, 0.4, 3.0]), # Closer
-        velocity=np.array([1.0, -1.5, -1.0]), # Slower
-        rotation=rotation_matrix,
-        size=0.5
-    )
-    static_cube = Cube(
-        position=np.array([-1.5, -0.5, 3.0]),
-        velocity=np.array([0.01, 0.0, 0.0]),
-        size=0.5
-    )
-
-    world.add_entity(camera)
-    world.add_entity(radar)
-    world.add_entity(target_cube)
-    world.add_entity(static_cube)
+    world, camera, radar = setup_simulation(delta_t=1/60.0)
 
     # Initialize Renderer
     try:
@@ -64,9 +27,8 @@ if __name__ == "__main__":
     # --- Main Loop ---
     print("\nStarting simulation loop...")
     frame_count = 0
-    max_frames = 150 # Run for 2.5 seconds at 60fps
+    max_frames = 90
 
-    # --- Store state from the previous frame ---
     prev_poses = {} # Store world_to_local poses from time t
 
     while not renderer.should_close() and frame_count < max_frames:
@@ -75,14 +37,12 @@ if __name__ == "__main__":
         # Store poses needed for T_A_to_B, T_A_to_R, and depth calculation
         prev_poses = {
             'camera': camera.get_pose_world_to_local(),
-             'radar': radar.get_pose_world_to_local(),
-             # Store entity states if needed for depth calculation
-             'entities': {entity: {'position': entity.position.copy(),
+            'radar': radar.get_pose_world_to_local(),
+            # Store entity states if needed for depth calculation
+            'entities': {entity: {'position': entity.position.copy(),
                                      'rotation': entity.rotation.copy()}
                            for entity in world.entities if isinstance(entity, Cube)}
         }
-        # If generate_point_cloud doesn't return entity/corner info,
-        # you might need a more complex way to associate points across time.
 
         # Update simulation state
         world.step()
@@ -102,7 +62,7 @@ if __name__ == "__main__":
                 detections=radar_detections,
                 radar_fov_az_rad=radar.fov_azimuth_rad,
                 radar_fov_el_rad=radar.fov_elevation_rad,
-                output_width=640, # Choose desired output size
+                output_width=640,
                 output_height=360,
                 color_map_range=(-5, 5) # Example speed range for color
             )
@@ -112,104 +72,35 @@ if __name__ == "__main__":
 
         flow = optical_flow_calculator.inference(current_frame_rgb)
 
-        current_frame_errors: List[float] = []
+        print(f"--- Frame {frame_count} (Time: {world.current_time:.2f}) ---")
+        if frame_count > 0: # Only estimate after first frame
+            current_frame_errors = estimate_velocities_for_frame(
+                radar_detections, flow, camera, radar, prev_poses, world.delta_t
+            )
 
-        # --- F. Calculate Full Velocity (if possible) ---
-        if frame_count > 0 and flow is not None and prev_poses: # Need previous state and flow
-            # 1. Get current poses (t+delta_t)
-            current_cam_pose_W2L = camera.get_pose_world_to_local()
-            # current_radar_pose_W2L = radar.get_pose_world_to_local() # Might not be needed directly
+            if current_frame_errors:
+                real_velocity_errors: List[float] = []
+                real_displacement_errors: List[float] = []
+                noisy_displacement_errors: List[float] = []
+                for velocity_error, displacement_error, isNoise in current_frame_errors:
+                    if(isNoise == False):
+                        real_velocity_errors.append(velocity_error)
+                        real_displacement_errors.append(displacement_error)
+                    else:
+                        noisy_displacement_errors.append(displacement_error)
 
-            # 2. Get previous poses (t)
-            prev_cam_pose_W2L = prev_poses['camera']
-            prev_radar_pose_W2L = prev_poses['radar']
+                
+                average_real_velocity_error = np.mean(real_velocity_errors)
+                average_real_displacement_error = np.mean(real_displacement_errors)
+                average_noisy_displacement_error = np.mean(noisy_displacement_errors)
 
-            # print(f"DETECTION FRAME {frame_count}")
-
-            # 3. Calculate transformation matrices relative to Camera A (time t)
-            # T_A_to_B: Pose B relative to A = W_B^-1 @ W_A
-            T_A_to_B = current_cam_pose_W2L @ np.linalg.inv(prev_cam_pose_W2L)
-            # T_A_to_R: Pose R (at t) relative to A = W_R^-1 @ W_A
-            T_A_to_R = prev_radar_pose_W2L @ np.linalg.inv(prev_cam_pose_W2L)
-            # print(f"T_A_to_B: {T_A_to_B}")
-            # print(f"T_A_to_R: {T_A_to_R}")
-
-            for detection in radar_detections:
-                 # Unpack detection info (assuming modified generate_point_cloud)
-                 point_radar_coords, speed_radial, source_entity = detection
-
-                 # --- Calculate (xq_pix, yq_pix) and (uq, vq) at t+delta_t ---
-                 # Convert radar point (t+delta_t) to world (t+delta_t)
-                 point_rad_h = np.append(point_radar_coords, 1.0)
-                 # print(f"point_rad_h: {point_rad_h}")
-                 # Need M_radar_to_world at t+delta_t (inverse of current radar W2L)
-                 M_radar_to_world_B = np.linalg.inv(radar.get_pose_world_to_local())
-                 # print(f"M_radar_to_world_B: {M_radar_to_world_B}")
-                 point_world_B_h = M_radar_to_world_B @ point_rad_h
-                 # print(f"point_world_B_h: {point_world_B_h}")
-
-                 # Convert world (t+delta_t) to camera (t+delta_t)
-                 point_cam_B_h = current_cam_pose_W2L @ point_world_B_h
-                 # print(f"point_cam_B_h: {point_cam_B_h}")
-                 point_cam_B = point_cam_B_h[:3]
-                 depth_B = point_cam_B[2]
-                 # print(f"depth_B: {depth_B}")
-
-                 if depth_B <= 1e-3: continue # Point is behind or too close to camera B
-
-                 # Normalized coords (t+delta_t)
-                 uq = point_cam_B[0] / depth_B
-                 vq = point_cam_B[1] / depth_B
-                 # print(f"uq: {uq}, vq: {vq}")
-
-                 # Pixel coords (t+delta_t) - careful with int conversion if needed early
-                 xq_pix_f = camera.fx * uq + camera.cx
-                 yq_pix_f = camera.fy * vq + camera.cy
-                 xq_pix = int(round(xq_pix_f))
-                 yq_pix = int(round(yq_pix_f))
-                 # print(f"xq_pix: {xq_pix}, yq_pix: {yq_pix}")
-
-                 # Check image bounds
-                 if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
-                     continue
-
-                 # --- Get flow and calculate (up, vp) at t ---
-                 dx, dy = flow[yq_pix, xq_pix] # Pixel flow
-                 # print(f"dx: {dx}, dy: {dy}")
-                 xp_pix_f = xq_pix_f - dx
-                 yp_pix_f = yq_pix_f - dy
-                 # print(f"xp_pix_f: {xp_pix_f}, yp_pix_f: {yp_pix_f}")
-
-                 # Normalized coords (t)
-                 up = (xp_pix_f - camera.cx) / camera.fx
-                 vp = (yp_pix_f - camera.cy) / camera.fy
-                 # print(f"up: {up}, vp: {vp}")
-
-                 # --- Call the solver ---
-                 full_vel_vector_radar = solve_full_velocity(
-                     up=up, vp=vp, uq=uq, vq=vq, d=depth_B, delta_t=world.delta_t,
-                     T_A_to_B=T_A_to_B, T_A_to_R=T_A_to_R,
-                     speed_radial=speed_radial, point_radar_coords=point_radar_coords,
-                     return_in_radar_coords=True # Or False if you want camera coords
-                 )
-
-                 if full_vel_vector_radar is not None:
-                     # print(f"  > Solved Vel (Radar Coords): {full_vel_vector_radar.round(3)} of {type(source_entity).__name__}")
-                     # Convert to world and compare to ground truth source_entity.velocity
-                     R_radar_to_world_A = np.linalg.inv(prev_radar_pose_W2L[0:3,0:3]) # Rotation of Radar at time t
-                     full_vel_world = R_radar_to_world_A @ full_vel_vector_radar
-                     #  print(f"    GT Vel (World Coords):   {source_entity.velocity.round(3)}")
-                     #  print(f"    Calc Vel (World Coords): {full_vel_world.round(3)}")
-
-                     error_magnitude = float(np.linalg.norm(full_vel_world - source_entity.velocity))
-
-                     current_frame_errors.append(error_magnitude)
-
-            if current_frame_errors: # Check if any errors were calculated
-                average_error_this_frame = np.mean(current_frame_errors)
-                print(f"  Avg Error at frame:{frame_count} ({len(current_frame_errors)} points): {average_error_this_frame:.4f}")
-            elif radar_detections: # If detections existed but none yielded velocity
-                 print("  No valid velocity estimates calculated this frame.")     
+                print(f"Average Real Velocity Error: {average_real_velocity_error:.6f} m/s")
+                print(f"Average Real Displacement Error: {average_real_displacement_error:.6f} pix")
+                print(f"Average Noisy Displacement Error: {average_noisy_displacement_error:.6f} pix")
+            elif radar_detections:
+                 print("  No valid velocity estimates calculated this frame.")
+        else:
+            print("  Waiting for next frame for velocity estimation...")
 
         # Handle window events and display frame
         renderer.swap_buffers_and_poll_events()
