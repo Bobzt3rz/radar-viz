@@ -18,7 +18,12 @@ class Camera:
         self.up = np.array(up, dtype=float)
 
         # Intrinsics
-        self.fov = 45.0
+        self.fx = 647.665206888116
+        self.fy = 647.665543907575
+        self.cx = 367.691476534482
+        self.cy = 285.201609563427
+        self.s = 0.0
+
         self.near_clip = 0.1
         self.far_clip = 100.0
 
@@ -37,67 +42,77 @@ class Camera:
     def apply_projection_matrix(self, width: int, height: int):
         """
         Applies the Projection transformation by manually building the
-        matrix from intrinsic parameters, consistent with the blog post:
+        matrix from stored intrinsic parameters (fx, fy, cx, cy),
+        following the method described in:
         https://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
-
-        Uses the 'y down' convention suitable for top-left image origins.
+        using a top-left image origin convention (y-down).
 
         Args:
             width (int): The width of the viewport/image in pixels.
             height (int): The height of the viewport/image in pixels.
         """
-        # Get intrinsic parameters based on the current viewport dimensions
-        intrinsics = self.get_intrinsics(width, height)
-        fx = intrinsics['fx']
-        fy = intrinsics['fy']
-        cx = intrinsics['cx']
-        cy = intrinsics['cy']
-
+        # Retrieve stored intrinsics and clipping planes
+        fx = self.fx
+        fy = self.fy
+        cx = self.cx
+        cy = self.cy
+        s = self.s # Skew
         znear = self.near_clip
         zfar = self.far_clip
 
-        # Map intrinsics to K matrix elements (assuming K01 skew = 0, x0=y0=0)
-        # K = [[fx,  0, cx],
-        #      [ 0, fy, cy],
-        #      [ 0,  0,  1]]
-        K00 = fx
-        K01 = 0  # Assuming zero skew
-        K02 = cx
-        K11 = fy
-        K12 = cy
-        x0 = 0 # Assuming image origin is 0
-        y0 = 0 # Assuming image origin is 0
+        # 1. Build the Perspective Transformation Matrix (Persp)
+        # Based on the blog post's formula, adapting K elements
+        # K = [[fx,  s, cx], [ 0, fy, cy], [ 0,  0,  1]]
+        # Note the sign changes for cx, cy and the last row for OpenGL's -Z view
+        A = znear + zfar
+        B = znear * zfar
+        Persp = np.zeros((4, 4), dtype=np.float32)
+        Persp[0, 0] = fx
+        Persp[0, 1] = s
+        Persp[0, 2] = -cx # Negated
+        Persp[1, 1] = fy
+        Persp[1, 2] = -cy # Negated
+        Persp[2, 2] = A   # Or -(zfar + znear) if K[2,2] was 1 initially
+        Persp[2, 3] = B   # Or -(2 * zfar * znear) if K[2,2] was 1 initially
+        Persp[3, 2] = -1  # Puts Z into W coordinate
 
-        # Build the projection matrix using the 'y down' formula from the blog post
-        P = np.zeros((4, 4), dtype=np.float32)
+        # 2. Build the Orthographic (NDC) Transformation Matrix
+        # Corresponds to glOrtho(0, width, height, 0, znear, zfar) for y-down
+        left, right = 0, width
+        bottom, top = height, 0 # Y points down
 
-        P[0, 0] = 2 * K00 / width
-        P[0, 1] = -2 * K01 / width # Skew term (0 here)
-        P[0, 2] = (width - 2 * K02 + 2 * x0) / width
-        P[0, 3] = 0
+        NDC = np.zeros((4, 4), dtype=np.float32)
+        NDC[0, 0] = 2.0 / (right - left)
+        NDC[1, 1] = 2.0 / (top - bottom) # Note: (top - bottom) is negative
+        NDC[2, 2] = -2.0 / (zfar - znear)
 
-        P[1, 1] = 2 * K11 / height # Positive for 'y down'
-        P[1, 2] = (-height + 2 * K12 + 2 * y0) / height
-        P[1, 3] = 0
+        NDC[0, 3] = -(right + left) / (right - left)
+        NDC[1, 3] = -(top + bottom) / (top - bottom)
+        NDC[2, 3] = -(zfar + znear) / (zfar - znear)
+        NDC[3, 3] = 1.0
 
-        P[2, 2] = (-zfar - znear) / (zfar - znear) # Z mapping
-        P[2, 3] = -2 * zfar * znear / (zfar - znear)
+        # 3. Combine: Proj = NDC * Persp
+        # Remember matrix multiplication order matters!
+        Proj = NDC @ Persp
 
-        P[3, 2] = -1 # Puts Z into W coordinate
-
-        # --- Debug: Print the calculated matrix ---
-        # print("\n--- Manually Calculated Projection Matrix ---")
-        # print(P)
+        # --- Optional Debug: Print the matrices ---
+        # print("\n--- Persp Matrix ---")
+        # print(Persp)
+        # print("--- NDC Matrix (Ortho equivalent) ---")
+        # print(NDC)
+        # print("--- Final Projection Matrix (Proj = NDC @ Persp) ---")
+        # print(Proj)
         # print("-------------------------------------------\n")
 
-        # Set OpenGL matrix mode and load the calculated matrix
+        # 4. Load the final matrix into OpenGL
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        # OpenGL expects column-major, so we transpose P before loading
-        glLoadMatrixf(P.T)
+        # OpenGL expects column-major, so transpose P before loading
+        glLoadMatrixf(Proj.T)
 
-        # Switch back to ModelView mode for the renderer
+        # Switch back to ModelView mode
         glMatrixMode(GL_MODELVIEW)
+    # --- END CHANGE 2 ---
 
     def _get_depth_buffer(self, world: World, width: int, height: int) -> np.ndarray:
         """
@@ -285,21 +300,10 @@ class Camera:
         return world_coords, modelview, projection, viewport
     
     def get_intrinsics(self, width: int, height: int) -> Dict[str, float]:
-            """
-            Calculates camera intrinsic parameters (fx, fy, cx, cy)
-            based on the camera's FOV and the viewport size.
-            """
-            # Vertical FOV from camera object
-            fov_y_rad = self.fov * np.pi / 180.0
-            
-            # Calculate focal lengths
-            fy = (height / 2.0) / np.tan(fov_y_rad / 2.0)
-            # Aspect ratio
-            aspect = width / float(height)
-            fx = fy * aspect # Assuming fov is vertical
-            
-            # Principal point (image center)
-            cx = width / 2.0
-            cy = height / 2.0
-            
-            return {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+        """
+        Returns the stored intrinsic parameters.
+        Width and height arguments are kept for compatibility but are not used
+        for calculation anymore.
+        """
+        # Return the directly stored values
+        return {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy}

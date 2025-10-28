@@ -13,3 +13,4 @@ __pycache__/
 
 # TODO: the repo for memflow, should change to be submodules
 simulation/modules/MemFlow/
+simulation2/modules/MemFlow/

@@ -37,7 +37,7 @@ if __name__ == "__main__":
     optical_flow = OpticalFlow()
     renderer = OpenGLRenderer(WINDOW_WIDTH, WINDOW_HEIGHT, "Sensor Rig Sim")
     cube2 = Cube(
-        position=[1.0, 0.25, -7.0], # World Coordinates (OpenGL: +X R, +Y U, +Z Out)
+        position=[1.0, -1.0, -5.0], # World Coordinates (OpenGL: +X R, +Y U, +Z Out)
         velocity=[-1.0, 0.0, 0.0], # World Coordinates (OpenGL)
         texture_path = TEXTURE_FILE
     )
@@ -120,6 +120,23 @@ if __name__ == "__main__":
             previous_projection is not None and \
             previous_modelview is not None:
 
+            try:
+                # Create PIL Images from the NumPy arrays
+                img_prev = Image.fromarray(previous_image)
+                img_curr = Image.fromarray(current_image)
+
+                # Define filenames (e.g., using frame_count)
+                prev_filename = f"frame_{frame_count-1:04d}.png"
+                curr_filename = f"frame_{frame_count:04d}.png"
+
+                # Save the images
+                img_prev.save(prev_filename)
+                img_curr.save(curr_filename)
+                print(f"Saved debug frames: {prev_filename}, {curr_filename}")
+
+            except Exception as e:
+                print(f"Error saving debug frames: {e}")
+
             print(f"\n[OPTICAL FLOW MODEL]")
             estimated_flow_map_raw = optical_flow.inference(previous_image, current_image)
 
@@ -186,7 +203,6 @@ if __name__ == "__main__":
                     perfect_flow_vector = ground_truth_flow_map[v_idx, u_idx]
                     perfect_flow_u, perfect_flow_v = perfect_flow_vector
 
-
                     u_pix_t1 = u_idx # Pixel index at t-1
                     v_pix_t1 = v_idx
                     u_pix_t2 = u_pix_t1 + flow_u_pix # Estimated pixel pos at t
@@ -219,10 +235,8 @@ if __name__ == "__main__":
                     correct_vq = Q_cam_solver[1] / Q_cam_solver[2]
                     print(f"[CORRECT]:")
                     print(f"  (correct_uq, correct_vq):    ({correct_uq:.4f}, {correct_vq:.4f})")
-                    # uq = Q_cam_solver[0] / Q_cam_solver[2] # Q_x / Q_z
-                    # vq = Q_cam_solver[1] / Q_cam_solver[2] # Q_y / Q_z
-                    
-
+                    uq = Q_cam_solver[0] / Q_cam_solver[2] # Q_x / Q_z
+                    vq = Q_cam_solver[1] / Q_cam_solver[2] # Q_y / Q_z
 
                     # --- Log Inputs ---
                     print(f"\n--- Processing Pixel ({u_idx}, {v_idx}) ---")
@@ -304,9 +318,9 @@ if __name__ == "__main__":
 
         frame_count += 1
 
-        if frame_count > 1:
-             print("Pausing after first successful solve. Close window to exit.")
-             # time.sleep(10) # Uncomment to pause automatically
-             break         # Uncomment to exit after first solve
+        # if frame_count > 1:
+        #      print("Pausing after first successful solve. Close window to exit.")
+        #      # time.sleep(10) # Uncomment to pause automatically
+        #      break         # Uncomment to exit after first solve
 
     renderer.shutdown()
