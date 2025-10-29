@@ -208,7 +208,7 @@ class Radar(Entity):
             clutter_point_radar = spherical_to_cartesian(clutter_r, clutter_az, clutter_el)
             
             # Give it a random radial velocity
-            clutter_speed = np.random.uniform(-30.0, 30.0) # e.g., +/- 1 m/s
+            clutter_speed = np.random.uniform(-3.0, 3.0) # e.g., +/- 1 m/s
             
             point_cloud.append((clutter_point_radar, clutter_speed, None, True)) # isNoise = True
 

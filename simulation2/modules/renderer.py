@@ -11,9 +11,6 @@ from .cube import Cube
 from .world import World
 from .types import Matrix4x4
 
-TEXTURE_LOC = "/home/bobberman/programming/radar/radar-viz/simulation2/assets/optical_flow_texture.png"
-TEXTURE_LOC = "/home/bobberman/programming/radar/radar-viz/simulation2/assets/checkerboard.png"
-
 # --- Simple Shaders ---
 VERTEX_SHADER = """
 #version 330 core
@@ -96,35 +93,50 @@ class Renderer:
         self.gl_conv: Matrix4x4 = np.diag([1,1,-1,1]).astype(np.float32)
 
         # --- Load Texture ---
-        self.textures = {} # Store texture IDs, maybe one per cube later
-        try:
-            texture_image = Image.open(TEXTURE_LOC).convert("RGB") # Load and ensure RGB
-            texture_data = np.array(texture_image, dtype=np.uint8)
-            texture_image.close()
-
-            self.textures['cube_default'] = glGenTextures(1)
-            glBindTexture(GL_TEXTURE_2D, self.textures['cube_default'])
-            # Texture parameters
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR) # Mipmapping for minification
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR) # Linear filtering for magnification
-            # Upload texture data
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, texture_image.width, texture_image.height, 0, GL_RGB, GL_UNSIGNED_BYTE, texture_data)
-            glGenerateMipmap(GL_TEXTURE_2D)
-            glBindTexture(GL_TEXTURE_2D, 0) # Unbind
-            print("  Loaded and created texture 'cube_texture.png'")
-        except FileNotFoundError:
-            print("Error: cube_texture.png not found! Cubes will likely be black.")
-            self.textures['cube_default'] = 0 # Indicate no texture loaded
-        except Exception as e:
-            print(f"Error loading texture: {e}")
-            self.textures['cube_default'] = 0
+        # We now load textures on-demand in _init_buffers
+        self.textures: Dict[str, int] = {} # Stores {path: tex_id}
 
         # --- GL Buffer Initialization ---
         self.render_data: Dict[Entity, Dict[str, Any]] = {}
         self._init_buffers() # This now needs to handle UVs
         print("Renderer Initialization Complete.")
+
+    def _load_texture_file(self, texture_path: str) -> int:
+        """
+        Loads a texture from a file path, stores its OpenGL ID,
+        and returns the ID. If already loaded, returns stored ID.
+        """
+        # Return the cached ID if we've loaded this texture before
+        if texture_path in self.textures:
+            return self.textures[texture_path]
+        
+        # Check for empty path
+        if not texture_path:
+            return 0 # 0 is an invalid texture ID
+
+        try:
+            # This logic is moved from __init__
+            texture_image = Image.open(texture_path).convert("RGB")
+            texture_data = np.array(texture_image, dtype=np.uint8)
+            texture_image.close()
+
+            tex_id = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, tex_id)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, texture_image.width, texture_image.height, 0, GL_RGB, GL_UNSIGNED_BYTE, texture_data)
+            glGenerateMipmap(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, 0)
+            
+            print(f"  Loaded texture: {texture_path} (ID: {tex_id})")
+            self.textures[texture_path] = tex_id # Store the new ID
+            return tex_id
+        except Exception as e:
+            print(f"Error loading texture {texture_path}: {e}")
+            self.textures[texture_path] = 0 # Cache 0 to prevent re-trying
+            return 0
 
 
     def _framebuffer_size_callback(self, window, width, height):
@@ -165,6 +177,11 @@ class Renderer:
                 glEnableVertexAttribArray(1)
                 glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, vertex_size_bytes, ctypes.c_void_p(3 * 4)) # Offset after 3 pos floats (12 bytes)
 
+                # Load the texture specified by the cube
+                texture_id_to_use = 0
+                if e.texture_path:
+                    texture_id_to_use = self._load_texture_file(e.texture_path)
+
                 # --- Unbind ---
                 glBindBuffer(GL_ARRAY_BUFFER, 0)
                 glBindVertexArray(0)
@@ -172,7 +189,7 @@ class Renderer:
                 self.render_data[e] = {
                     "vao": vao, "vbo": vbo, "ebo": ebo,
                     "indices_count": len(indices),
-                    "texture_id": self.textures.get('cube_default', 0) # Assign default texture
+                    "texture_id": texture_id_to_use
                  }
                 print(f"    Created textured buffers for Cube (VAO: {vao})")
         print("  Buffer initialization complete.")

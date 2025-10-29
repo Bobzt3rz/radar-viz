@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from .entity import Entity
 from .types import Vector3, Matrix3x3
@@ -14,7 +14,8 @@ class Cube(Entity):
                  velocity: Vector3, 
                  rotation: Matrix3x3 = np.eye(3), 
                  size: float = 1.0,
-                 texture_repeat: float = 1.0):
+                 texture_repeat: float = 1.0,
+                 texture_path: Optional[str] = None):
         
         # --- Call the parent class's constructor ---
         # This initializes self.position, self.velocity, self.rotation,
@@ -24,6 +25,7 @@ class Cube(Entity):
         # --- Cube-specific properties ---
         self.size: float = size
         self.texture_repeat: float = texture_repeat
+        self.texture_path: Optional[str] = texture_path
 
     def get_local_vertices(self) -> List[Vector3]:
         """
