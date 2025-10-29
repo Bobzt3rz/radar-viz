@@ -10,7 +10,8 @@ class Entity:
     def __init__(self, 
                  position: Vector3, 
                  velocity: Vector3, 
-                 rotation: Matrix3x3 = np.eye(3)):
+                 rotation: Matrix3x3 = np.eye(3),
+                 angular_velocity: Vector3 = np.zeros(3)):
         
         # --- State in World Coordinates ---
         
@@ -22,6 +23,9 @@ class Entity:
         
         # Orientation (3x3 rotation matrix) in the world
         self.rotation: Matrix3x3 = np.asarray(rotation, dtype=np.floating)
+
+        # Angular velocity (wx, wy, wz) in world coordinates (rad/s)
+        self.angular_velocity: Vector3 = np.asarray(angular_velocity, dtype=np.floating)
         
         # --- 4x4 Pose Matrices ---
         
@@ -55,8 +59,32 @@ class Entity:
         This is a simple linear physics model.
         """
         # 1. Update position based on velocity
-        #    (We're not updating rotation in this simple model)
         self.position += self.velocity * delta_t
+
+        angular_speed = np.linalg.norm(self.angular_velocity)
+        
+        if angular_speed > 1e-6: # Only rotate if there's non-zero velocity
+            # Amount to rotate this frame
+            theta = angular_speed * delta_t
+            
+            # Normalized axis of rotation
+            axis = self.angular_velocity / angular_speed
+            
+            # Create the 3x3 rotation matrix for this delta_t
+            # Using Rodrigues' rotation formula
+            K = np.array([
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0]
+            ])
+            cos_theta = np.cos(theta)
+            sin_theta = np.sin(theta)
+            
+            R_delta = np.eye(3) + (sin_theta * K) + ((1 - cos_theta) * (K @ K))
+            
+            # Apply the rotation: R_new = R_delta @ R_old
+            # This rotates the entity in the world frame
+            self.rotation = R_delta @ self.rotation
         
         # 2. Rebuild the pose matrices with the new position
         self._update_pose_matrices()

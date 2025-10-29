@@ -78,11 +78,12 @@ class Radar(Entity):
                  rotation: Matrix3x3 = np.eye(3),
                  fov_azimuth_deg: float = 60.0,
                  fov_elevation_deg: float = 30.0,
-                 max_range: float = 100.0,
+                 max_range: float = 40.0,
                  num_rays_azimuth: int = 64, # Number of horizontal rays
-                 num_rays_elevation: int = 32 # Number of vertical rays
+                 num_rays_elevation: int = 32, # Number of vertical rays,\
+                 angular_velocity: Vector3 = np.zeros(3)
                  ):
-        super().__init__(position, velocity, rotation)
+        super().__init__(position, velocity, rotation, angular_velocity)
         self.fov_azimuth_rad = np.radians(fov_azimuth_deg)
         self.fov_elevation_rad = np.radians(fov_elevation_deg)
         self.max_range = max_range
@@ -207,7 +208,7 @@ class Radar(Entity):
             clutter_point_radar = spherical_to_cartesian(clutter_r, clutter_az, clutter_el)
             
             # Give it a random radial velocity
-            clutter_speed = np.random.uniform(-3.0, 3.0) # e.g., +/- 1 m/s
+            clutter_speed = np.random.uniform(-30.0, 30.0) # e.g., +/- 1 m/s
             
             point_cloud.append((clutter_point_radar, clutter_speed, None, True)) # isNoise = True
 

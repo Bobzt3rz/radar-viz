@@ -9,7 +9,9 @@ from modules.radar import visualize_radar_points, save_radar_point_cloud_ply
 from modules.cube import Cube
 from modules.renderer import Renderer
 from modules.optical_flow import OpticalFlow
-from modules.utils import save_image
+from modules.utils import save_image, save_frame_histogram
+
+
 
 if __name__ == "__main__":
 
@@ -50,7 +52,7 @@ if __name__ == "__main__":
         radar_detections = radar.generate_point_cloud(world)
 
         # Render the current state
-        renderer.render_scene(near=0.1, far=100.0)
+        renderer.render_scene(near=0.1, far=1000.0)
 
         current_frame_rgb = renderer.capture_frame()
 
@@ -82,17 +84,30 @@ if __name__ == "__main__":
                 real_velocity_errors: List[float] = []
                 real_displacement_errors: List[float] = []
                 noisy_displacement_errors: List[float] = []
-                for velocity_error, displacement_error, isNoise in current_frame_errors:
+                real_vel_magnitudes = []
+                noisy_vel_magnitudes = []
+                for velocity_magnitude, velocity_error, displacement_error, isNoise in current_frame_errors:
                     if(isNoise == False):
+                        real_vel_magnitudes.append(velocity_magnitude)
                         real_velocity_errors.append(velocity_error)
                         real_displacement_errors.append(displacement_error)
                     else:
+                        noisy_vel_magnitudes.append(velocity_magnitude)
                         noisy_displacement_errors.append(displacement_error)
-
                 
                 average_real_velocity_error = np.mean(real_velocity_errors)
                 average_real_displacement_error = np.mean(real_displacement_errors)
                 average_noisy_displacement_error = np.mean(noisy_displacement_errors)
+
+                save_frame_histogram(
+                        frame_number=frame_count,
+                        real_pred_vel_mags=real_vel_magnitudes,
+                        real_vel_errors=real_velocity_errors,
+                        real_disp_errors=real_displacement_errors,
+                        noisy_pred_vel_mags=noisy_vel_magnitudes,
+                        noisy_disp_errors=noisy_displacement_errors,
+                        output_dir="output/frame_analysis"
+                    )
 
                 print(f"Average Real Velocity Error: {average_real_velocity_error:.6f} m/s")
                 print(f"Average Real Displacement Error: {average_real_displacement_error:.6f} pix")

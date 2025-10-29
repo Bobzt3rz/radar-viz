@@ -123,12 +123,12 @@ def estimate_velocities_for_frame(
     radar: Radar,
     prev_poses: Dict[str, Any],
     world_delta_t: float
-) -> List[Tuple[float, float, float]]:
+) -> List[Tuple[float, float, float, float]]:
     """
     Calculates full velocity for radar detections using data from two time steps.
-    Returns a list of 3d velocity error magnitude, 2d reprojection error magnitudes for successful estimations and flag whether it is a noisy point.
+    Returns a list of 3d velocity magnitudes, 3d velocity error magnitude, 2d reprojection error magnitudes for successful estimations and flag whether it is a noisy point.
     """
-    frame_errors: List[Tuple[float, float, float]] = []
+    frame_errors: List[Tuple[float, float, float, float]] = []
 
     # Check if we have necessary data
     if flow is None or not prev_poses or 'camera' not in prev_poses:
@@ -222,6 +222,7 @@ def estimate_velocities_for_frame(
 
         # --- Calculate and store error ---
         if full_vel_vector_radar is not None:
+            full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
             full_vel_world = R_A_radar_to_world @ full_vel_vector_radar
             # print(f"full_vel_radar: {full_vel_vector_radar}, full_vel_world: {full_vel_world}, ground_truth_vel: {ground_truth_vel}")
             frame_displacement_error = calculate_reprojection_error(full_vel_radar_A=full_vel_vector_radar,   # Arg 1: Vel in Radar(A)
@@ -237,13 +238,11 @@ def estimate_velocities_for_frame(
             if frame_displacement_error is not None and source_entity is not None:
                 ground_truth_vel = source_entity.velocity
                 velocity_error_magnitude = float(np.linalg.norm(full_vel_world - ground_truth_vel))
-                frame_errors.append((velocity_error_magnitude, frame_displacement_error, False))
+                frame_errors.append((full_vel_magnitude, velocity_error_magnitude, frame_displacement_error, False))
                 continue
             
             if(frame_displacement_error is not None and isNoise):
-                frame_errors.append((0.0, frame_displacement_error, True))
-            
-        
+                frame_errors.append((full_vel_magnitude, 0.0, frame_displacement_error, True))
 
     return frame_errors
 

@@ -17,9 +17,10 @@ class Camera(Entity):
                  image_width: int,
                  image_height: int,
                  skew: float = 0.0,     # Skew factor (s in docs)
-                 rotation: Matrix3x3 = np.eye(3)):
+                 rotation: Matrix3x3 = np.eye(3),
+                 angular_velocity: Vector3 = np.zeros(3)):
 
-        super().__init__(position, velocity, rotation)
+        super().__init__(position, velocity, rotation, angular_velocity)
 
         # Store intrinsics
         self.fx = fx

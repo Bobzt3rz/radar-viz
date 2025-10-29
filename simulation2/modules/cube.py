@@ -13,7 +13,8 @@ class Cube(Entity):
                  position: Vector3, 
                  velocity: Vector3, 
                  rotation: Matrix3x3 = np.eye(3), 
-                 size: float = 1.0):
+                 size: float = 1.0,
+                 texture_repeat: float = 1.0):
         
         # --- Call the parent class's constructor ---
         # This initializes self.position, self.velocity, self.rotation,
@@ -22,6 +23,7 @@ class Cube(Entity):
         
         # --- Cube-specific properties ---
         self.size: float = size
+        self.texture_repeat: float = texture_repeat
 
     def get_local_vertices(self) -> List[Vector3]:
         """
@@ -52,7 +54,7 @@ class Cube(Entity):
         # Unique texture coordinates (e.g., corners of a square texture)
         # Decide how the texture maps to the cube faces
         t = np.array([
-            [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0] # Standard square UV coords
+            [0.0, 0.0], [self.texture_repeat, 0.0], [self.texture_repeat, self.texture_repeat], [0.0, self.texture_repeat] # Standard square UV coords
         ], dtype=np.float32)
 
         # Define vertices and UVs *per face* (4 vertices per face, 6 faces = 24 vertices total)
