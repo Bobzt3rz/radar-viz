@@ -84,20 +84,30 @@ if __name__ == "__main__":
                 real_velocity_errors: List[float] = []
                 real_displacement_errors: List[float] = []
                 noisy_displacement_errors: List[float] = []
-                real_vel_magnitudes = []
-                noisy_vel_magnitudes = []
-                for velocity_magnitude, velocity_error, displacement_error, isNoise in current_frame_errors:
-                    if(isNoise == False):
-                        real_vel_magnitudes.append(velocity_magnitude)
-                        real_velocity_errors.append(velocity_error)
-                        real_displacement_errors.append(displacement_error)
-                    else:
-                        noisy_vel_magnitudes.append(velocity_magnitude)
-                        noisy_displacement_errors.append(displacement_error)
+                real_vel_magnitudes: List[float] = []
+                noisy_vel_magnitudes: List[float] = []
                 
-                average_real_velocity_error = np.mean(real_velocity_errors)
-                average_real_displacement_error = np.mean(real_displacement_errors)
-                average_noisy_displacement_error = np.mean(noisy_displacement_errors)
+                real_positions: List[np.ndarray] = []
+                real_velocities: List[np.ndarray] = []
+                noisy_positions: List[np.ndarray] = []
+                noisy_velocities: List[np.ndarray] = []
+                
+                for vel_mag, vel_err, disp_err, isNoise, pos_3d, vel_3d_world in current_frame_errors:
+                    if(isNoise == False):
+                        real_vel_magnitudes.append(vel_mag)
+                        real_velocity_errors.append(vel_err)
+                        real_displacement_errors.append(disp_err)
+                        real_positions.append(pos_3d)
+                        real_velocities.append(vel_3d_world)
+                    else:
+                        noisy_vel_magnitudes.append(vel_mag)
+                        noisy_displacement_errors.append(disp_err)
+                        noisy_positions.append(pos_3d)
+                        noisy_velocities.append(vel_3d_world)
+                
+                average_real_velocity_error = np.mean(real_velocity_errors) if real_velocity_errors else 0
+                average_real_displacement_error = np.mean(real_displacement_errors) if real_displacement_errors else 0
+                average_noisy_displacement_error = np.mean(noisy_displacement_errors) if noisy_displacement_errors else 0
 
                 save_frame_histogram(
                         frame_number=frame_count,
@@ -106,6 +116,10 @@ if __name__ == "__main__":
                         real_disp_errors=real_displacement_errors,
                         noisy_pred_vel_mags=noisy_vel_magnitudes,
                         noisy_disp_errors=noisy_displacement_errors,
+                        real_positions=real_positions,
+                        real_velocities=real_velocities,
+                        noisy_positions=noisy_positions,
+                        noisy_velocities=noisy_velocities,
                         output_dir="output/frame_analysis"
                     )
 

@@ -194,7 +194,7 @@ class Radar(Entity):
 
         # --- 4. GENERATE CLUTTER (FALSE POSITIVES) ---
         # You can make this a random number, e.g., np.random.poisson(3)
-        num_clutter_points = 200 
+        num_clutter_points = 50 
         
         azimuth_fov = self.fov_azimuth_rad
         elevation_fov = self.fov_elevation_rad

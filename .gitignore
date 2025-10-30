@@ -4,6 +4,7 @@ outputs/*
 *.npy
 *.png
 simulation/assets/
+simulation2/output/
 
 # Python
 __pycache__/

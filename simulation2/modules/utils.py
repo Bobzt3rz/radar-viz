@@ -46,18 +46,21 @@ def save_image(img_array: np.ndarray, file_path: str) -> bool:
     
 def save_frame_histogram(
     frame_number: int,
-    real_pred_vel_mags: List[float],    # <-- NEW
+    real_pred_vel_mags: List[float],
     real_vel_errors: List[float],
     real_disp_errors: List[float],
-    noisy_pred_vel_mags: List[float],   # <-- NEW
+    noisy_pred_vel_mags: List[float],
     noisy_disp_errors: List[float],
+    real_positions: List[np.ndarray],
+    real_velocities: List[np.ndarray],
+    noisy_positions: List[np.ndarray],
+    noisy_velocities: List[np.ndarray],
     output_dir: str = "output/debug_histograms"
 ):
     """
-    Saves a 3x2 analysis plot for a SINGLE frame.
-    - Row 1: Velocity Error (Hist) | Vel Mag vs. Vel Error (Scatter)
-    - Row 2: Real Disp Error (Hist) | Pred Vel Mag vs. Real Disp Error (Scatter)
-    - Row 3: Noisy Disp Error (Hist) | Pred Vel Mag vs. Noisy Disp Error (Scatter)
+    Saves a 2x4 analysis plot for a SINGLE frame.
+    - Row 1: Vel Err (Hist) | Real Disp (Hist) | Noisy Disp (Hist) | 3D Position (Cluster)
+    - Row 2: Vel Err (Scatter) | Real Disp (Scatter) | Noisy Disp (Scatter) | 3D Velocity (Cluster)
     """
     
     # --- 1. Create Directory ---
@@ -71,10 +74,13 @@ def save_frame_histogram(
     noisy_pred_vel_np = np.array(noisy_pred_vel_mags)
     noisy_disp_np = np.array(noisy_disp_errors)
 
-    # --- 3. Create Plot (3 rows, 2 columns) ---
+    # --- 3. Create Plot (2 rows, 4 columns) ---
     plt.style.use('ggplot')
-    fig, axes = plt.subplots(3, 2, figsize=(18, 20)) # <-- 3x2 layout
-    fig.suptitle(f'Frame {frame_number} - Error Analysis', fontsize=16)
+    # --- MODIFIED: 2x4 layout, wider figure ---
+    fig, axes = plt.subplots(2, 4, figsize=(34, 16)) 
+    fig.suptitle(f'Frame {frame_number} - Error and Cluster Analysis', fontsize=16)
+
+    # === ROW 1: HISTOGRAMS AND POSITION ===
 
     # --- Row 1, Col 1: Real Velocity Error (Histogram) ---
     ax = axes[0, 0]
@@ -88,27 +94,17 @@ def save_frame_histogram(
         ax.set_title("Real Velocity Error\n(No Data)")
     ax.set_ylabel("Count")
 
-    # --- Row 1, Col 2: Real Pred Vel Mag vs. Velocity Error (Scatter) ---
-    ax = axes[0, 1]
-    if real_pred_vel_np.size > 0 and real_vel_err_np.size > 0:
-        ax.scatter(real_pred_vel_np, real_vel_err_np, color='blue', alpha=0.6, s=10)
-        ax.set_title(f"Real: Pred. Vel Mag vs. Vel Error (N={len(real_pred_vel_np)})")
-        ax.set_xlabel("Predicted Velocity Mag (m/s)")
-        ax.set_ylabel("Velocity Error (m/s)")
-    else:
-        ax.set_title("Real: Pred. Vel Mag vs. Vel Error\n(No Data)")
-
-    # --- Shared Bins for Displacement Histograms (Rows 2 & 3, Col 1) ---
+    # --- Shared Bins for Displacement Histograms ---
     disp_bins = 20
-    all_disp_data = np.concatenate((real_disp_np, noisy_disp_np)) # <-- This is the data we need for the Y-axis
+    all_disp_data = np.concatenate((real_disp_np, noisy_disp_np))
     if all_disp_data.size > 0:
         global_min, global_max = np.min(all_disp_data), np.max(all_disp_data)
         if global_min == global_max:
             global_min -= 0.5; global_max += 0.5
         disp_bins = np.linspace(global_min, global_max, 21) # 21 edges = 20 bins
 
-    # --- Row 2, Col 1: Real Displacement Error (Histogram) ---
-    ax = axes[1, 0]
+    # --- Row 1, Col 2: Real Displacement Error (Histogram) ---
+    ax = axes[0, 1]
     if real_disp_np.size > 0:
         ax.hist(real_disp_np, bins=disp_bins, color='green', alpha=0.7, edgecolor='black')
         mean_val = np.mean(real_disp_np)
@@ -121,8 +117,8 @@ def save_frame_histogram(
         ax.set_title("Real Displacement Error\n(No Data)")
     ax.set_ylabel("Count")
 
-    # --- Row 3, Col 1: Noisy Displacement Error (Histogram) ---
-    ax = axes[2, 0]
+    # --- Row 1, Col 3: Noisy Displacement Error (Histogram) ---
+    ax = axes[0, 2]
     if noisy_disp_np.size > 0:
         ax.hist(noisy_disp_np, bins=disp_bins, color='purple', alpha=0.7, edgecolor='black')
         mean_val = np.mean(noisy_disp_np)
@@ -135,29 +131,62 @@ def save_frame_histogram(
         ax.set_title("Noisy Displacement Error\n(No Data)")
     ax.set_ylabel("Count")
 
-    # --- Shared X-Axis for Scatter Plots (Rows 2 & 3, Col 2) ---
+    # --- Row 1, Col 4: 3D Position (Radar Coords) ---
+    ax = axes[0, 3]
+    ax.remove() # Remove the 2D axes
+    ax_pos = fig.add_subplot(2, 4, 4, projection='3d') # Add 3D subplot
+    
+    if real_positions:
+        real_pos_np = np.array(real_positions)
+        ax_pos.scatter(real_pos_np[:, 0], real_pos_np[:, 1], real_pos_np[:, 2], 
+                       c='blue', s=10, label=f'Real (N={len(real_pos_np)})', alpha=0.5)
+    if noisy_positions:
+        noisy_pos_np = np.array(noisy_positions)
+        ax_pos.scatter(noisy_pos_np[:, 0], noisy_pos_np[:, 1], noisy_pos_np[:, 2], 
+                       c='red', s=5, label=f'Noisy (N={len(noisy_pos_np)})', alpha=0.1)
+    
+    ax_pos.set_title("3D Position (Radar Coordinates)")
+    ax_pos.set_xlabel("X (m)")
+    ax_pos.set_ylabel("Y (m)")
+    ax_pos.set_zlabel("Z (m)")
+    ax_pos.legend()
+
+
+    # === ROW 2: SCATTER PLOTS AND VELOCITY ===
+
+    # --- Shared X-Axis for Scatter Plots ---
     scatter_x_min, scatter_x_max = 0, 1
     all_pred_vel_data = np.concatenate((real_pred_vel_np, noisy_pred_vel_np))
     if all_pred_vel_data.size > 0:
         scatter_x_min, scatter_x_max = np.min(all_pred_vel_data), np.max(all_pred_vel_data)
         if scatter_x_min == scatter_x_max:
             scatter_x_min -= 0.5; scatter_x_max += 0.5
-        # Add a little padding
         padding = (scatter_x_max - scatter_x_min) * 0.05
         scatter_x_min -= padding
         scatter_x_max += padding
 
-    # --- Shared Y-Axis for Scatter Plots (Rows 2 & 3, Col 2) ---  # <-- NEW SECTION
+    # --- Shared Y-Axis for Displacement Scatters ---
     scatter_y_min, scatter_y_max = 0, 1
-    # We already calculated all_disp_data for the histograms
     if all_disp_data.size > 0:
         scatter_y_min, scatter_y_max = np.min(all_disp_data), np.max(all_disp_data)
         if scatter_y_min == scatter_y_max:
             scatter_y_min -= 0.5; scatter_y_max += 0.5
-        # Add a little padding
         padding = (scatter_y_max - scatter_y_min) * 0.05
         scatter_y_min -= padding
         scatter_y_max += padding
+
+
+    # --- Row 2, Col 1: Real Pred Vel Mag vs. Velocity Error (Scatter) ---
+    ax = axes[1, 0]
+    if real_pred_vel_np.size > 0 and real_vel_err_np.size > 0:
+        ax.scatter(real_pred_vel_np, real_vel_err_np, color='blue', alpha=0.6, s=10)
+        ax.set_title(f"Real: Pred. Vel Mag vs. Vel Error (N={len(real_pred_vel_np)})")
+        ax.set_xlabel("Predicted Velocity Mag (m/s)")
+        ax.set_ylabel("Velocity Error (m/s)")
+        if all_pred_vel_data.size > 0:
+             ax.set_xlim(scatter_x_min, scatter_x_max)
+    else:
+        ax.set_title("Real: Pred. Vel Mag vs. Vel Error\n(No Data)")
 
 
     # --- Row 2, Col 2: Real Pred Vel Mag vs. Displacement Error (Scatter) ---
@@ -169,13 +198,13 @@ def save_frame_histogram(
         ax.set_ylabel("Displacement Error (pixels)")
         if all_pred_vel_data.size > 0:
              ax.set_xlim(scatter_x_min, scatter_x_max)
-        if all_disp_data.size > 0: # <-- NEW
-             ax.set_ylim(scatter_y_min, scatter_y_max) # <-- NEW
+        if all_disp_data.size > 0:
+             ax.set_ylim(scatter_y_min, scatter_y_max)
     else:
         ax.set_title("Real: Pred. Vel Mag vs. Disp. Error\n(No Data)")
 
-    # --- Row 3, Col 2: Noisy Pred Vel Mag vs. Displacement Error (Scatter) ---
-    ax = axes[2, 1]
+    # --- Row 2, Col 3: Noisy Pred Vel Mag vs. Displacement Error (Scatter) ---
+    ax = axes[1, 2]
     if noisy_pred_vel_np.size > 0 and noisy_disp_np.size > 0:
         ax.scatter(noisy_pred_vel_np, noisy_disp_np, color='purple', alpha=0.6, s=10)
         ax.set_title(f"Noisy: Pred. Vel Mag vs. Disp. Error (N={len(noisy_pred_vel_np)})")
@@ -183,10 +212,33 @@ def save_frame_histogram(
         ax.set_ylabel("Displacement Error (pixels)")
         if all_pred_vel_data.size > 0:
              ax.set_xlim(scatter_x_min, scatter_x_max)
-        if all_disp_data.size > 0: # <-- NEW
-             ax.set_ylim(scatter_y_min, scatter_y_max) # <-- NEW
+        if all_disp_data.size > 0:
+             ax.set_ylim(scatter_y_min, scatter_y_max)
     else:
         ax.set_title("Noisy: Pred. Vel Mag vs. Disp. Error\n(No Data)")
+
+    # --- Row 2, Col 4: 3D Solved Velocity (World Coords) ---
+    ax = axes[1, 3]
+    ax.remove() # Remove the 2D axes
+    ax_vel = fig.add_subplot(2, 4, 8, projection='3d') # Add 3D subplot
+
+    if real_velocities:
+        real_vel_np = np.array(real_velocities)
+        ax_vel.scatter(real_vel_np[:, 0], real_vel_np[:, 1], real_vel_np[:, 2], 
+                       c='blue', s=10, label=f'Real (N={len(real_vel_np)})', alpha=0.5)
+    if noisy_velocities:
+        noisy_vel_np = np.array(noisy_velocities)
+        ax_vel.scatter(noisy_vel_np[:, 0], noisy_vel_np[:, 1], noisy_vel_np[:, 2], 
+                       c='red', s=5, label=f'Noisy (N={len(noisy_vel_np)})', alpha=0.1)
+
+    ax_vel.set_title("3D Solved Velocity (World Coords)")
+    ax_vel.set_xlabel("Vx (m/s)")
+    ax_vel.set_ylabel("Vy (m/s)")
+    ax_vel.set_zlabel("Vz (m/s)")
+    ax_vel.legend()
+    ax_vel.set_xlim([-5, 5])
+    ax_vel.set_ylim([-5, 5])
+    ax_vel.set_zlim([-5, 5])
 
     # --- 4. Save and Close ---
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])

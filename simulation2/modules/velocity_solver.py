@@ -67,9 +67,6 @@ def solve_full_velocity(
     # Calculate the unit direction vector from radar origin to the point
     unit_direction_vector: Vector3 = point_radar_coords / distance
 
-    # Calculate the 3D radial velocity vector in RADAR coordinates
-    v_r: Vector3 = speed_radial * unit_direction_vector
-
     # --- 2. Extract matrix components ---
     a11, a12, a13, bx = T_A_to_B[0, :]
     a21, a22, a23, by = T_A_to_B[1, :]
@@ -84,8 +81,7 @@ def solve_full_velocity(
     M[1, 0] = a21 - vq * a31
     M[1, 1] = a22 - vq * a32
     M[1, 2] = a23 - vq * a33
-    R_T: Matrix3x3 = R_cam_to_radar.T
-    M[2, :] = R_T @ v_r # Uses the calculated v_r
+    M[2, :] = R_cam_to_radar.T @ unit_direction_vector
 
     # --- 4. Build the 3x1 vector B (Eq 16a) ---
     B: Vector3 = np.zeros(3, dtype=np.floating)
@@ -95,7 +91,8 @@ def solve_full_velocity(
     term3_d: float = (a31*up + a32*vp + a33) * vq
     term4_d: float = -(a21*up + a22*vp + a23)
     B[1] = (term3_d + term4_d) * d + (vq * bz - by)
-    B[2] = np.dot(v_r, v_r) * delta_t # Uses the calculated v_r
+
+    B[2] = speed_radial * delta_t
 
     # --- 5. Solve the linear system M * t_vec = B ---
     try:
@@ -123,17 +120,18 @@ def estimate_velocities_for_frame(
     radar: Radar,
     prev_poses: Dict[str, Any],
     world_delta_t: float
-) -> List[Tuple[float, float, float, float]]:
+) -> List[Tuple[float, float, float, bool, Vector3, Vector3]]:
     """
     Calculates full velocity for radar detections using data from two time steps.
-    Returns a list of 3d velocity magnitudes, 3d velocity error magnitude, 2d reprojection error magnitudes for successful estimations and flag whether it is a noisy point.
+    Returns a list of tuples:
+    (vel_mag, vel_err, disp_err, isNoise, pos_3d_radar, vel_3d_world)
     """
-    frame_errors: List[Tuple[float, float, float, float]] = []
+    frame_results: List[Tuple[float, float, float, bool, Vector3, Vector3]] = []
 
     # Check if we have necessary data
     if flow is None or not prev_poses or 'camera' not in prev_poses:
         # print("  Waiting for prev state/flow...") # Optional debug
-        return frame_errors # Return empty list if prerequisites not met
+        return frame_results # Return empty list if prerequisites not met
 
     # 1. Get current & previous poses
     try:
@@ -147,7 +145,7 @@ def estimate_velocities_for_frame(
 
     except (KeyError, np.linalg.LinAlgError, TypeError):
         print("  Error accessing or inverting previous poses.")
-        return frame_errors # Return empty if poses are missing/invalid
+        return frame_results # Return empty if poses are missing/invalid
 
     # 2. Calculate relative transformations (given these from ego velocity estimation + calibration)
     T_A_to_B = current_cam_pose_W2L @ inv_prev_cam_pose_W2L
@@ -158,7 +156,7 @@ def estimate_velocities_for_frame(
         T_Cam_from_Radar_static = np.linalg.inv(T_A_to_R)
     except np.linalg.LinAlgError:
         print("  Error inverting T_A_to_R to find static extrinsic.")
-        return frame_errors
+        return frame_results
 
     # --- SIMULATION-ONLY ---
     # This part is ONLY for comparing against world-frame ground truth.
@@ -220,31 +218,32 @@ def estimate_velocities_for_frame(
             return_in_radar_coords=True
         )
 
-        # --- Calculate and store error ---
+        
         if full_vel_vector_radar is not None:
             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
             full_vel_world = R_A_radar_to_world @ full_vel_vector_radar
-            # print(f"full_vel_radar: {full_vel_vector_radar}, full_vel_world: {full_vel_world}, ground_truth_vel: {ground_truth_vel}")
-            frame_displacement_error = calculate_reprojection_error(full_vel_radar_A=full_vel_vector_radar,   # Arg 1: Vel in Radar(A)
-                point_radar_B=point_radar_coords,        # Arg 2: Point in Radar(B)
-                T_Cam_from_Radar=np.linalg.inv(T_A_to_R),  # Arg 3: Static Extrinsic
-                T_CamB_from_CamA=T_A_to_B,               # Arg 4: Relative Motion
+            
+            frame_displacement_error = calculate_reprojection_error(
+                full_vel_radar_A=full_vel_vector_radar,
+                point_radar_B=point_radar_coords,
+                T_Cam_from_Radar=T_Cam_from_Radar_static,
+                T_CamB_from_CamA=T_A_to_B,
                 flow=flow, 
                 camera=camera, 
                 xq_pix_f=xq_pix_f, 
                 yq_pix_f=yq_pix_f, 
-                delta_t=world_delta_t)
+                delta_t=world_delta_t
+            )
              
             if frame_displacement_error is not None and source_entity is not None:
                 ground_truth_vel = source_entity.velocity
                 velocity_error_magnitude = float(np.linalg.norm(full_vel_world - ground_truth_vel))
-                frame_errors.append((full_vel_magnitude, velocity_error_magnitude, frame_displacement_error, False))
+                frame_results.append((full_vel_magnitude, velocity_error_magnitude, frame_displacement_error, False, point_radar_coords, full_vel_world))
                 continue
             
             if(frame_displacement_error is not None and isNoise):
-                frame_errors.append((full_vel_magnitude, 0.0, frame_displacement_error, True))
-
-    return frame_errors
+                frame_results.append((full_vel_magnitude, 0.0, frame_displacement_error, True, point_radar_coords, full_vel_world))
+    return frame_results
 
 def calculate_reprojection_error(
     full_vel_radar_A: Vector3,            # Velocity expressed in Radar(A) frame

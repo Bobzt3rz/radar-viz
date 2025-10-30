@@ -28,7 +28,7 @@ def setup_simulation(delta_t: float = 1/60.0) -> Tuple[World, Camera, Radar]:
         fx=800.0, fy=800.0, cx=1280/2, cy=720/2, image_width=1280, image_height=720
     )
     radar = Radar(
-        position=np.array([0.0, 0.0, 0.0]),
+        position=np.array([0.5, 0.0, 0.0]),
         velocity=rig_linear_velocity,
         angular_velocity=rig_angular_velocity,
         fov_azimuth_deg=90, fov_elevation_deg=40, max_range=40
@@ -43,7 +43,7 @@ def setup_simulation(delta_t: float = 1/60.0) -> Tuple[World, Camera, Radar]:
         [-sin_a,  0,  cos_a]
     ], dtype=np.float32)
     target_cube = Cube(
-        position=np.array([0.0, 0.0, 5.0]), # Closer
+        position=np.array([-1.0, 0.0, 5.0]), # Closer
         velocity=np.array([2.0, 0.0, 0.0]), # Slower
         rotation=rotation_matrix,
         size=0.5,
@@ -55,9 +55,27 @@ def setup_simulation(delta_t: float = 1/60.0) -> Tuple[World, Camera, Radar]:
         size=0.5,
         texture_path=TEXTURE_CHECKERBOARD
     )
+    static_cube_2 = Cube(
+        position=np.array([-1.5, 1.0, 5.0]),
+        velocity=np.array([0.001, 0.0, 0.0]),
+        size=0.5,
+        texture_path=TEXTURE_CHECKERBOARD
+    )
+    static_cube_3 = Cube(
+        position=np.array([1.5, 1.0, 5.0]),
+        velocity=np.array([0.001, 0.0, 0.0]),
+        size=0.5,
+        texture_path=TEXTURE_CHECKERBOARD
+    )
+    static_cube_4 = Cube(
+        position=np.array([1.5, -1.0, 5.0]),
+        velocity=np.array([0.001, 0.0, 0.0]),
+        size=0.5,
+        texture_path=TEXTURE_CHECKERBOARD
+    )
     cube_2 = Cube(
         position=np.array([0.0, 1.0, 5.0]),
-        velocity=np.array([-2.0, 0.0, 0.0]),
+        velocity=np.array([-2.0, -1.0, 1.0]),
         rotation=rotation_matrix,
         size=0.5,
         texture_path=TEXTURE_CHECKERBOARD
@@ -83,6 +101,9 @@ def setup_simulation(delta_t: float = 1/60.0) -> Tuple[World, Camera, Radar]:
     world.add_entity(radar)
     world.add_entity(target_cube)
     world.add_entity(static_cube)
+    world.add_entity(static_cube_2)
+    world.add_entity(static_cube_3)
+    world.add_entity(static_cube_4)
     world.add_entity(cube_2)
     world.add_entity(background_wall)
     world.add_entity(floor)
