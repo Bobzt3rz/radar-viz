@@ -29,8 +29,10 @@ if __name__ == "__main__":
     # --- Main Loop ---
     print("\nStarting simulation loop...")
     frame_count = 0
-    max_frames = 90
+    max_frames = 51
 
+    all_real_velocity_abs_errors = []
+    all_real_velocity_actual_magnitudes = []
     prev_poses = {} # Store world_to_local poses from time t
 
     while not renderer.should_close() and frame_count < max_frames:
@@ -105,6 +107,9 @@ if __name__ == "__main__":
                         noisy_positions.append(pos_3d)
                         noisy_velocities.append(vel_3d_world)
                 
+                all_real_velocity_abs_errors.extend(real_velocity_errors)
+                all_real_velocity_actual_magnitudes.extend(real_vel_magnitudes)
+
                 average_real_velocity_error = np.mean(real_velocity_errors) if real_velocity_errors else 0
                 average_real_displacement_error = np.mean(real_displacement_errors) if real_displacement_errors else 0
                 average_noisy_displacement_error = np.mean(noisy_displacement_errors) if noisy_displacement_errors else 0
@@ -138,4 +143,31 @@ if __name__ == "__main__":
 
     # Cleanup
     print("\nSimulation loop finished.")
+
+    print("\n--- Overall Simulation Results ---")
+    if all_real_velocity_abs_errors and all_real_velocity_actual_magnitudes:
+        
+        errors_array = np.array(all_real_velocity_abs_errors)
+        actuals_array = np.array(all_real_velocity_actual_magnitudes)
+        
+        # 1. Calculate Global MAE (Mean Absolute Error)
+        global_mae = np.mean(errors_array)
+        
+        # 2. Calculate Mean Actual Speed
+        mean_actual_speed = np.mean(actuals_array)
+
+        print(f"Global Mean Absolute Error (MAE):   {global_mae:.6f} m/s")
+        print(f"Mean Actual Object Speed:             {mean_actual_speed:.6f} m/s")
+        
+        # 3. Calculate NMAE (and check for division by zero)
+        if mean_actual_speed > 1e-6:
+            global_nmae = (global_mae / mean_actual_speed) * 100.0 # As a percentage
+            print(f"Normalized MAE (NMAE):              {global_nmae:.2f} %")
+        else:
+            print("Normalized MAE (NMAE):              N/A (Mean actual speed is zero)")
+
+        print(f"(Based on {len(errors_array)} total valid detections)")
+    else:
+        print("No valid real velocity errors were recorded to calculate an overall average.")
+
     renderer.cleanup()
