@@ -74,7 +74,7 @@ if __name__ == "__main__":
             save_image(cv2.cvtColor(radar_image, cv2.COLOR_BGR2RGB), # Convert BGR to RGB for Pillow
                        f"output/radar_image/{frame_count:04d}.png")
 
-        flow = optical_flow_calculator.inference(current_frame_rgb)
+        flow = optical_flow_calculator.inference_cv(current_frame_rgb)
 
         print(f"--- Frame {frame_count} (Time: {world.current_time:.2f}) ---")
         if frame_count > 0: # Only estimate after first frame
