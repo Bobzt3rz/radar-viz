@@ -120,13 +120,13 @@ def estimate_velocities_for_frame(
     radar: Radar,
     prev_poses: Dict[str, Any],
     world_delta_t: float
-) -> List[Tuple[float, float, float, bool, Vector3, Vector3]]:
+) -> List[Tuple[float, float, float, bool, Vector3, Vector3, Vector3]]:
     """
     Calculates full velocity for radar detections using data from two time steps.
     Returns a list of tuples:
-    (vel_mag, vel_err, disp_err, isNoise, pos_3d_radar, vel_3d_world)
+    (vel_mag, vel_err, disp_err, isNoise, pos_3d_radar, vel_3d_radar, vel_3d_world)
     """
-    frame_results: List[Tuple[float, float, float, bool, Vector3, Vector3]] = []
+    frame_results: List[Tuple[float, float, float, bool, Vector3, Vector3, Vector3]] = []
 
     # Check if we have necessary data
     if flow is None or not prev_poses or 'camera' not in prev_poses:
@@ -238,11 +238,15 @@ def estimate_velocities_for_frame(
             if frame_displacement_error is not None and source_entity is not None:
                 ground_truth_vel = source_entity.velocity
                 velocity_error_magnitude = float(np.linalg.norm(full_vel_world - ground_truth_vel))
-                frame_results.append((full_vel_magnitude, velocity_error_magnitude, frame_displacement_error, False, point_radar_coords, full_vel_world))
+                frame_results.append((full_vel_magnitude, 
+                                      velocity_error_magnitude, frame_displacement_error, 
+                                      False, point_radar_coords, full_vel_vector_radar, full_vel_world))
                 continue
             
             if(frame_displacement_error is not None and isNoise):
-                frame_results.append((full_vel_magnitude, 0.0, frame_displacement_error, True, point_radar_coords, full_vel_world))
+                frame_results.append((full_vel_magnitude, 
+                                      0.0, frame_displacement_error, 
+                                      True, point_radar_coords, full_vel_vector_radar, full_vel_world))
     return frame_results
 
 def calculate_reprojection_error(

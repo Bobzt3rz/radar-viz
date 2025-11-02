@@ -2,7 +2,7 @@ from PIL import Image
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List
+from typing import List, Tuple
 
 def save_image(img_array: np.ndarray, file_path: str) -> bool:
     """
@@ -246,6 +246,132 @@ def save_frame_histogram(
     
     try:
         plt.savefig(save_path)
+    except Exception as e:
+        print(f"Error saving analysis plot: {e}")
+    
+    plt.close(fig) # Close the figure to free up memory
+
+# This is the new type hint for your DetectionTuple, add it to this file
+# (vel_mag, vel_err, disp_err, isNoise, pos_3d_radar, vel_3d_radar, vel_3d_world)
+DetectionTuple = Tuple[float, float, float, bool, np.ndarray, np.ndarray, np.ndarray]
+
+def save_clustering_analysis_plot(
+    frame_number: int,
+    clusters: List[List[DetectionTuple]],
+    noise_points: List[DetectionTuple],
+    tp: int, fp: int, fn: int, tn: int,
+    precision: float, recall: float, f1: float,
+    output_dir: str = "output/clustering_analysis"
+):
+    """
+    Saves a 2x2 analysis plot for a single frame showing clustering performance.
+    
+    - Top-Left: 3D plot of all points (Ground Truth)
+    - Top-Right: 3D plot of filtered cluster points
+    - Bottom-Left: Bar chart of detection counts (TP, FP, FN, TN)
+    - Bottom-Right: Bar chart of performance scores (Precision, Recall, F1)
+    """
+    
+    # --- 1. Create Directory ---
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # --- 2. Create Plot (2 rows, 2 columns) ---
+    plt.style.use('ggplot')
+    fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+    fig.suptitle(f'Frame {frame_number} - Clustering Analysis', fontsize=16, weight='bold')
+
+    # === PLOT 1: Ground Truth (All Detections) ===
+    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+    
+    # Collect all points first to set plot limits
+    all_points_pos = []
+    real_points_pos = []
+    noisy_points_pos = []
+
+    all_detections = noise_points + [det for cluster in clusters for det in cluster]
+    
+    for det in all_detections:
+        pos = det[4] # pos_3d_radar
+        all_points_pos.append(pos)
+        if det[3]: # isNoise == True
+            noisy_points_pos.append(pos)
+        else:
+            real_points_pos.append(pos)
+
+    if real_points_pos:
+        real_pos_np = np.array(real_points_pos)
+        ax1.scatter(real_pos_np[:, 0], real_pos_np[:, 1], real_pos_np[:, 2], 
+                    c='blue', s=20, label=f'Real (N={len(real_pos_np)})', alpha=0.7)
+    if noisy_points_pos:
+        noisy_pos_np = np.array(noisy_points_pos)
+        ax1.scatter(noisy_pos_np[:, 0], noisy_pos_np[:, 1], noisy_pos_np[:, 2], 
+                    c='red', s=5, label=f'Noisy (N={len(noisy_pos_np)})', alpha=0.2)
+    
+    ax1.set_title("Ground Truth (All Detections)")
+    ax1.set_xlabel("X (m)"); ax1.set_ylabel("Y (m)"); ax1.set_zlabel("Z (m)")
+    ax1.legend()
+
+
+    # === PLOT 2: Filter Result (Clustered Points) ===
+    ax2 = fig.add_subplot(2, 2, 2, projection='3d')
+    
+    if not clusters:
+        ax2.set_title("Filter Result (No Clusters Found)")
+    else:
+        # Get a different color for each cluster
+        colors = plt.cm.get_cmap('tab10', len(clusters))
+        
+        for i, cluster in enumerate(clusters):
+            cluster_points_pos = []
+            for det in cluster:
+                cluster_points_pos.append(det[4]) # pos_3d_radar
+            
+            cluster_pos_np = np.array(cluster_points_pos)
+            ax2.scatter(cluster_pos_np[:, 0], cluster_pos_np[:, 1], cluster_pos_np[:, 2], 
+                        c=[colors(i)], s=20, label=f'Cluster {i} (N={len(cluster_pos_np)})')
+
+        ax2.set_title(f"Filter Result ({len(clusters)} Clusters Found)")
+
+    # Set same axis limits as Plot 1 for easy comparison
+    if all_points_pos:
+        all_pos_np = np.array(all_points_pos)
+        min_lim = np.min(all_pos_np, axis=0)
+        max_lim = np.max(all_pos_np, axis=0)
+        ax1.set_xlim(min_lim[0], max_lim[0]); ax1.set_ylim(min_lim[1], max_lim[1]); ax1.set_zlim(min_lim[2], max_lim[2])
+        ax2.set_xlim(min_lim[0], max_lim[0]); ax2.set_ylim(min_lim[1], max_lim[1]); ax2.set_zlim(min_lim[2], max_lim[2])
+
+    ax2.set_xlabel("X (m)"); ax2.set_ylabel("Y (m)"); ax2.set_zlabel("Z (m)")
+    ax2.legend()
+
+    # === PLOT 3: Detection Counts (Bar Chart) ===
+    ax3 = axes[1, 0]
+    count_labels = ['True Pos (TP)', 'False Pos (FP)', 'False Neg (FN)', 'True Neg (TN)']
+    count_values = [tp, fp, fn, tn]
+    count_colors = ['#4CAF50', '#F44336', '#FF9800', '#9E9E9E']
+    
+    bars = ax3.bar(count_labels, count_values, color=count_colors)
+    ax3.bar_label(bars)
+    ax3.set_title("Detection Counts")
+    ax3.set_ylabel("Number of Points")
+
+    # === PLOT 4: Performance Scores (Bar Chart) ===
+    ax4 = axes[1, 1]
+    score_labels = ['Precision', 'Recall', 'F1-Score']
+    score_values = [precision, recall, f1]
+    score_colors = ['#2196F3', '#9C27B0', '#00BCD4']
+    
+    bars = ax4.bar(score_labels, score_values, color=score_colors)
+    ax4.bar_label(bars, fmt='{:.2f}')
+    ax4.set_title("Filter Performance Scores")
+    ax4.set_ylabel("Score (0.0 - 1.0)")
+    ax4.set_ylim(0, 1.05)
+
+    # --- 4. Save and Close ---
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
+    save_path = os.path.join(output_dir, f"frame_{frame_number:04d}_analysis.png")
+    
+    try:
+        fig.savefig(save_path)
     except Exception as e:
         print(f"Error saving analysis plot: {e}")
     

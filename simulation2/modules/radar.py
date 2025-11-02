@@ -192,9 +192,31 @@ class Radar(Entity):
 
                 point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity, False))
 
+                # --- ADD MULTIPATH GHOST (e.g., a "ground reflection") ---
+                # Only add ghosts for, say, 30% of real points
+                if np.random.rand() < 0.5:
+                    
+                    # Create a ghost point mirrored over the ground plane
+                    # (e.g., if ground is at y=1.5, move it "under" the ground)
+                    ghost_pos_radar = np.copy(hit_point_radar)
+                    ghost_pos_radar[1] = 1.5 + (1.5 - ghost_pos_radar[1]) # Reflect over y=1.5
+                    
+                    # Add some extra position noise
+                    ghost_pos_radar += np.random.normal(0.0, 0.2, 3) # 20cm noise
+                    
+                    # The ghost has the *same radial velocity* as the real point
+                    ghost_speed_radial = speed_radial + np.random.normal(0.0, 0.1)
+                    
+                    point_cloud.append((
+                        ghost_pos_radar,
+                        ghost_speed_radial,
+                        None,  # No entity
+                        True   # It is noise
+                    ))
+
         # --- 4. GENERATE CLUTTER (FALSE POSITIVES) ---
         # You can make this a random number, e.g., np.random.poisson(3)
-        num_clutter_points = 50 
+        num_clutter_points = 500 
         
         azimuth_fov = self.fov_azimuth_rad
         elevation_fov = self.fov_elevation_rad
