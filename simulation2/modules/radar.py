@@ -7,7 +7,7 @@ import os
 from .entity import Entity
 from .world import World
 from .cube import Cube
-from .types import Vector3, Matrix3x3
+from .types import Vector3, Matrix3x3, NoiseType, DetectionTuple
 
 def ray_cube_intersection(ray_origin_world: Vector3,
                           ray_direction_world: Vector3,
@@ -137,12 +137,12 @@ class Radar(Entity):
 
         return np.array(directions, dtype=np.float32) # Shape: (N_rays, 3)
 
-    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Optional[Entity], bool]]:
+    def generate_point_cloud(self, world: World) -> List[Tuple[Vector3, float, Optional[Entity], NoiseType]]:
         """
         Generates radar detections using dense ray casting.
-        Returns: [(point_pos_radar_coords, speed_radial, hit_entity, isNoise), ...]
+        Returns: [(point_pos_radar_coords, speed_radial, hit_entity, noiseType), ...]
         """
-        point_cloud: List[Tuple[Vector3, float, Optional[Entity], bool]] = []
+        point_cloud: List[Tuple[Vector3, float, Optional[Entity], NoiseType]] = []
 
         radar_origin_world = self.position
         M_world_to_radar = self.get_pose_world_to_local()
@@ -190,28 +190,41 @@ class Radar(Entity):
                 los_unit_vec_world = ray_dir_world # Direction is already normalized unit vector
                 speed_radial = np.dot(hit_entity_vel_world, los_unit_vec_world)
 
-                point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity, False))
+                point_cloud.append((hit_point_radar, speed_radial, closest_hit_entity, NoiseType.REAL))
 
-                # --- ADD MULTIPATH GHOST (e.g., a "ground reflection") ---
-                # Only add ghosts for, say, 30% of real points
-                if np.random.rand() < 0.5:
+                # --- 2. NEW: Add "Elevation Offset" Multipath Ghost ---
+                if np.random.rand() < 0.5: # adjust chance
                     
-                    # Create a ghost point mirrored over the ground plane
-                    # (e.g., if ground is at y=1.5, move it "under" the ground)
-                    ghost_pos_radar = np.copy(hit_point_radar)
-                    ghost_pos_radar[1] = 1.5 + (1.5 - ghost_pos_radar[1]) # Reflect over y=1.5
+                    # 1. Convert perfect Cartesian to perfect Spherical
+                    r, az, el = cartesian_to_spherical_radar(
+                        hit_point_radar[0], 
+                        hit_point_radar[1], 
+                        hit_point_radar[2]
+                    )
                     
-                    # Add some extra position noise
-                    ghost_pos_radar += np.random.normal(0.0, 0.2, 3) # 20cm noise
+                    # 2. Define a fixed angular offset for the ghost
+                    #    This guarantees separation.
+                    GHOST_ELEVATION_OFFSET_DEG = 15.0
                     
-                    # The ghost has the *same radial velocity* as the real point
-                    ghost_speed_radial = speed_radial + np.random.normal(0.0, 0.1)
+                    r_ghost = r
+                    az_ghost = az
+                    # Add the offset. 50% chance of being above, 50% below.
+                    offset_dir = 1.0 if np.random.rand() > 0.5 else -1.0
+                    el_ghost = el + (offset_dir * np.radians(GHOST_ELEVATION_OFFSET_DEG))
+                    
+                    # 3. Convert ghost spherical back to Cartesian
+                    ghost_pos_radar = spherical_to_cartesian(
+                        r_ghost, az_ghost, el_ghost
+                    )
+                    
+                    # 4. Ghost has the *exact same* radial velocity
+                    ghost_speed_radial = speed_radial
                     
                     point_cloud.append((
                         ghost_pos_radar,
                         ghost_speed_radial,
                         None,  # No entity
-                        True   # It is noise
+                        NoiseType.MULTIPATH_GHOST
                     ))
 
         # --- 4. GENERATE CLUTTER (FALSE POSITIVES) ---
@@ -230,31 +243,29 @@ class Radar(Entity):
             clutter_point_radar = spherical_to_cartesian(clutter_r, clutter_az, clutter_el)
             
             # Give it a random radial velocity
-            clutter_speed = np.random.uniform(-3.0, 3.0) # e.g., +/- 1 m/s
+            clutter_speed = np.random.uniform(-10.0, 10.0) # e.g., +/- 10 m/s
             
-            point_cloud.append((clutter_point_radar, clutter_speed, None, True)) # isNoise = True
+            point_cloud.append((clutter_point_radar, clutter_speed, None, NoiseType.RANDOM_CLUTTER))
 
         return point_cloud
     
 def visualize_radar_points(
-    detections: List[Tuple[Vector3, float, Optional[Entity], bool]], # Assuming ray casting output
+    detections: List[Tuple[Vector3, float, Optional[Entity], NoiseType]], # Updated type hint
     radar_fov_az_rad: float,
     radar_fov_el_rad: float,
     output_width: int,
-    output_height: int,
-    color_map_range: Optional[Tuple[float, float]] = (-10.0, 10.0) # Speed range for color
+    output_height: int
 ) -> np.ndarray:
     """
     Projects radar points onto a 2D image plane based on radar FoV.
+    Points are color-coded based on their NoiseType ground truth.
 
     Args:
-        detections: List of tuples (point_radar_coords, speed_radial, entity).
+        detections: List of tuples (point_radar_coords, speed_radial, entity, noise_type).
         radar_fov_az_rad: Horizontal field of view in radians.
         radar_fov_el_rad: Vertical field of view in radians.
         output_width: Width of the output visualization image.
         output_height: Height of the output visualization image.
-        color_map_range: Tuple (min_speed, max_speed) for color mapping radial velocity.
-                         Set to None to draw all points in white.
 
     Returns:
         A NumPy array (HxWx3 BGR uint8) representing the visualization.
@@ -263,7 +274,6 @@ def visualize_radar_points(
     image = np.zeros((output_height, output_width, 3), dtype=np.uint8)
 
     # Calculate scaling factors based on FoV for perspective projection
-    # tan(FoV/2) relates the half-dimension at distance z=1
     max_u_at_z1 = np.tan(radar_fov_az_rad / 2.0)
     max_v_at_z1 = np.tan(radar_fov_el_rad / 2.0)
 
@@ -274,47 +284,42 @@ def visualize_radar_points(
     center_x = output_width / 2.0
     center_y = output_height / 2.0
 
-    # Prepare colormap if needed
-    cmap = cv2.COLORMAP_JET # Or COLORMAP_VIRIDIS, etc.
-    min_speed, max_speed = 0, 1 # Default values
-    use_color = color_map_range is not None
-    if use_color and color_map_range:
-        min_speed, max_speed = color_map_range
-        speed_range = max_speed - min_speed
-        if speed_range <= 0: speed_range = 1.0 # Avoid division by zero
+    # --- NEW: Define colors for each noise type (in BGR format) ---
+    # Matches the colors from your 3D analysis plot
+    COLOR_REAL = (255, 0, 0)      # Blue
+    COLOR_MULTIPATH = (255, 255, 255)  # White
+    COLOR_RANDOM = (0, 0, 255)     # Red
+    # -------------------------------------------------------------
 
-
-    for point_rad, speed_rad, entity, isNoise in detections:
+    # The 4th item in the tuple is now noiseType
+    for point_rad, speed_rad, entity, noiseType in detections:
         x, y, z = point_rad
 
         # Ensure point is in front of the radar
         if z <= 1e-3: # Use a small epsilon
             continue
 
-        # Perspective projection to normalized coords (relative to FoV at z=1)
+        # Perspective projection
         u_norm = x / z
         v_norm = y / z # Positive V means DOWN in radar space
 
         # Map normalized coords to pixel coords
-        # Points at +/- max_u_at_z1 should map to 0 or width
-        # Points at +/- max_v_at_z1 should map to 0 or height
         pixel_x = int(round(center_x + u_norm * scale_x))
-        # Negate v_norm's contribution to map Y-down radar space to Y-up visualization effect
-        pixel_y = int(round(center_y - v_norm * scale_y))
+        # +y (down) in 3D -> +v_norm (down) -> +pixel_y (down) in image
+        pixel_y = int(round(center_y + v_norm * scale_y))
 
 
         # Check if point is within image bounds
         if 0 <= pixel_x < output_width and 0 <= pixel_y < output_height:
-            # Determine color
-            color = (255, 255, 255) # Default: White (BGR)
-            if use_color:
-                # Normalize speed to 0-1 range
-                norm_speed = (speed_rad - min_speed) / speed_range # type: ignore
-                norm_speed_clipped = np.clip(norm_speed, 0.0, 1.0)
-                # Map to colormap (expects value 0-255)
-                color_idx = int(norm_speed_clipped * 255)
-                # Apply colormap (returns BGR)
-                color = cv2.applyColorMap(np.array([[color_idx]], dtype=np.uint8), cmap)[0][0].tolist()
+            
+            # --- NEW: Determine color based on NoiseType ---
+            if noiseType == NoiseType.REAL:
+                color = COLOR_REAL
+            elif noiseType == NoiseType.MULTIPATH_GHOST:
+                color = COLOR_MULTIPATH
+            else: # RANDOM_CLUTTER
+                color = COLOR_RANDOM
+            # -----------------------------------------------
 
             # Draw a small circle for the point
             cv2.circle(image, (pixel_x, pixel_y), radius=2, color=color, thickness=-1) # Filled circle
@@ -365,7 +370,7 @@ def spherical_to_cartesian(r: float, az: float, el: float) -> Vector3:
     return np.array([x, y, z])
 
 def save_radar_point_cloud_ply(
-    detections: List[Tuple[Vector3, float, Optional[Entity], bool]], # Ray casting output format
+    detections: List[Tuple[Vector3, float, Optional[Entity], NoiseType]], # Ray casting output format
     file_path: str
 ) -> bool:
     """
@@ -424,7 +429,7 @@ def save_radar_point_cloud_ply(
 
     # --- Prepare Data Lines ---
     data_lines = []
-    for point_rad, speed_rad, entity, isNoise in detections:
+    for point_rad, speed_rad, entity, noiseType in detections:
         x, y, z = point_rad
         range_val, az_rad, el_rad = cartesian_to_spherical_radar(x, y, z)
         # Format: x y z azimuth elevation range radial_velocity

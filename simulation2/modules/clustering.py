@@ -1,10 +1,7 @@
 import numpy as np
 from sklearn.cluster import DBSCAN
 from typing import List, Tuple, Dict, Any
-
-# This is the type hint for one of your detection tuples:
-# (vel_mag, vel_err, disp_err, isNoise, pos_3d_radar, vel_3d_radar, vel_3d_world)
-DetectionTuple = Tuple[float, float, float, bool, np.ndarray, np.ndarray, np.ndarray]
+from .types import DetectionTuple, NoiseType
 
 def cluster_detections_6d(
     detections: List[DetectionTuple],
@@ -58,17 +55,39 @@ def cluster_detections_6d(
     # --- 4. Sort results into clusters and noise ---
     final_clusters = []
     final_noise = []
+
+    debug = True
     
+    if(debug): print("--- [Clustering Debug] Multipath Point Classification ---")
+
     unique_labels = set(labels)
     for k in unique_labels:
         indices = np.where(labels == k)[0]
+        
         if k == -1:
-            # Add all noise points to the noise list
+            # This point was labeled as "NOISE" by DBSCAN
             for i in indices:
-                final_noise.append(detections[i])
+                det = detections[i]
+                final_noise.append(det)
+                
+                # --- DEBUG CHECK 1 ---
+                # Check if a multipath point was CORRECTLY filtered
+                if det[3] == NoiseType.MULTIPATH_GHOST and debug:
+                    print(f"  [MULTIPATH -> FILTERED (TN)] Pos: {np.round(det[4], 2)}, Vel: {np.round(det[5], 2)}")
         else:
-            # Add all cluster points
-            cluster_group = [detections[i] for i in indices]
+            # This point was put into a CLUSTER
+            cluster_group = []
+            for i in indices:
+                det = detections[i]
+                cluster_group.append(det)
+                
+                # --- DEBUG CHECK 2 ---
+                # Check if a multipath point was INCORRECTLY clustered
+                if det[3] == NoiseType.MULTIPATH_GHOST and debug:
+                    print(f"  [MULTIPATH -> CLUSTERED (FP)] Pos: {np.round(det[4], 2)}, Vel: {np.round(det[5], 2)} -> Cluster {k}")
+            
             final_clusters.append(cluster_group)
+            
+    if(debug): print("---------------------------------------------------------")
             
     return final_clusters, final_noise

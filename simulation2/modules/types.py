@@ -15,7 +15,6 @@ class NoiseType(Enum):
     REAL = 0              # A real point from an object
     RANDOM_CLUTTER = 1    # Uniformly random noise
     MULTIPATH_GHOST = 2   # A "ghost" reflection of a real object
-    ROAD_CLUTTER = 3      # Spatially/velocit-correlated road noise
 
 # (vel_mag, vel_err, disp_err, noise_type, pos_3d_radar, vel_3d_radar, vel_3d_world)
 DetectionTuple = Tuple[float, float, float, NoiseType, np.ndarray, np.ndarray, np.ndarray]

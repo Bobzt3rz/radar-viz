@@ -11,6 +11,7 @@ from modules.renderer import Renderer
 from modules.optical_flow import OpticalFlow
 from modules.utils import save_image, save_frame_histogram, save_clustering_analysis_plot
 from modules.clustering import cluster_detections_6d
+from modules.types import NoiseType
 
 if __name__ == "__main__":
 
@@ -72,13 +73,12 @@ if __name__ == "__main__":
                 radar_fov_el_rad=radar.fov_elevation_rad,
                 output_width=640,
                 output_height=360,
-                color_map_range=(-5, 5) # Example speed range for color
             )
             # Save the radar visualization
             save_image(cv2.cvtColor(radar_image, cv2.COLOR_BGR2RGB), # Convert BGR to RGB for Pillow
                        f"output/radar_image/{frame_count:04d}.png")
 
-        flow = optical_flow_calculator.inference_cv(current_frame_rgb)
+        flow = optical_flow_calculator.inference(current_frame_rgb)
 
         print(f"--- Frame {frame_count} (Time: {world.current_time:.2f}) ---")
         if frame_count > 0: # Only estimate after first frame
@@ -91,42 +91,84 @@ if __name__ == "__main__":
                 # Run the clustering function
                 clusters, noise_points = cluster_detections_6d(
                     detections=current_frame_errors,
-                    eps=1.0,              # Tune this 6D distance (1.0 is a good start)
+                    eps=0.7,              # Tune this 6D distance (1.0 is a good start)
                     min_samples=4,        # Same as before
-                    velocity_weight=1.5   # Tune this (e.g., care slightly more about velocity)
+                    velocity_weight=4.0   
                 )
 
-                total_real_points = sum(1 for det in current_frame_errors if not det[3])
-                total_noisy_points = sum(1 for det in current_frame_errors if det[3])
+                # --- NEW PERFORMANCE ANALYSIS (THE "FULL PICTURE") ---
+                
+                # 1. Get Ground Truth Counts
+                gt_real = 0
+                gt_random = 0
+                gt_multipath = 0
+                for det in current_frame_errors:
+                    if det[3] == NoiseType.REAL: gt_real += 1
+                    elif det[3] == NoiseType.RANDOM_CLUTTER: gt_random += 1
+                    elif det[3] == NoiseType.MULTIPATH_GHOST: gt_multipath += 1
+                
+                total_real_points = gt_real
+                total_noisy_points = gt_random + gt_multipath
 
-                tp, fp, fn, tn = 0, 0, 0, 0
-
+                # 2. Calculate TP, FP, FN, TN
+                tp, fn = 0, 0
+                fp_random, fp_multipath = 0, 0
+                tn_random, tn_multipath = 0, 0
+                
                 for cluster in clusters:
                     for det in cluster:
-                        if det[3]: fp += 1
-                        else: tp += 1
+                        if det[3] == NoiseType.REAL:
+                            tp += 1
+                        elif det[3] == NoiseType.RANDOM_CLUTTER:
+                            fp_random += 1
+                        elif det[3] == NoiseType.MULTIPATH_GHOST:
+                            fp_multipath += 1
 
                 for det in noise_points:
-                    if det[3]: tn += 1
-                    else: fn += 1
+                    if det[3] == NoiseType.REAL:
+                        fn += 1
+                    elif det[3] == NoiseType.RANDOM_CLUTTER:
+                        tn_random += 1
+                    elif det[3] == NoiseType.MULTIPATH_GHOST:
+                        tn_multipath += 1
+                
+                # 3. Aggregate Totals and Calculate Key Metrics
+                total_fp = fp_random + fp_multipath
+                total_tn = tn_random + tn_multipath
+                
+                precision = tp / (tp + total_fp) if (tp + total_fp) > 0 else 0.0
+                
+                recall = tp / total_real_points if total_real_points > 0 else 0.0
 
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
                 f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
+                # 4. Save metrics for overall results
                 all_tp.append(tp)
-                all_fp.append(fp)
+                all_fp.append(total_fp)
                 all_fn.append(fn)
-                all_tn.append(tn)
+                all_tn.append(total_tn)
 
-                print(f"  Clustering: {len(clusters)} clusters found, {len(noise_points)} points filtered.")
-                print(f"  Scores: Precision={precision*100:.1f}%, Recall={recall*100:.1f}%")
+                # 5. Print the Full Report
+                # (This part was already correct and will now display the right values)
+                print(f"  Ground Truth: {total_real_points} Real | {total_noisy_points} Noisy (Random:{gt_random}, MP:{gt_multipath})")
+                print(f"  Algorithm Output: {len(clusters)} Clusters, {len(noise_points)} Noise Points")
+                print(f"  True Positives (TP):  {tp:4d} (Real points found)")
+                print(f"  False Negatives (FN): {fn:4d} (Real points missed)")
+                print(f"  False Positives (FP): {total_fp:4d} (Total noise clustered)")
+                print(f"    - FP Random:    {fp_random:4d} (Filtered {tn_random}/{gt_random})")
+                print(f"    - FP Multipath: {fp_multipath:4d} (Filtered {tn_multipath}/{gt_multipath})")
+                print(f"  Precision: {precision * 100:6.2f}% | Recall: {recall * 100:6.2f}% | F1-Score: {f1 * 100:6.2f}%")
+                print(f"--------------------------------------")
+                
+                # 6. Save the plot
+                fp_dict = {'random': fp_random, 'mp': fp_multipath}
+                tn_dict = {'random': tn_random, 'mp': tn_multipath}
                 
                 save_clustering_analysis_plot(
                     frame_number=frame_count,
                     clusters=clusters,
                     noise_points=noise_points,
-                    tp=tp, fp=fp, fn=fn, tn=tn,
+                    tp=tp, fp_dict=fp_dict, fn=fn, tn_dict=tn_dict,
                     precision=precision, recall=recall, f1=f1,
                     output_dir="output/clustering_analysis"
                 )
@@ -143,8 +185,8 @@ if __name__ == "__main__":
                 noisy_positions: List[np.ndarray] = []
                 noisy_velocities: List[np.ndarray] = []
                 
-                for vel_mag, vel_err, disp_err, isNoise, pos_3d, vel_3d_radar, vel_3d_world in current_frame_errors:
-                    if(isNoise == False):
+                for vel_mag, vel_err, disp_err, noiseType, pos_3d, vel_3d_radar, vel_3d_world in current_frame_errors:
+                    if(noiseType == NoiseType.REAL):
                         real_vel_magnitudes.append(vel_mag)
                         real_velocity_errors.append(vel_err)
                         real_displacement_errors.append(disp_err)
