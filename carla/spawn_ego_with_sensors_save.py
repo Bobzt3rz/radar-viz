@@ -41,13 +41,18 @@ class RadarPoint:
     elevation: float # rad
     range: float     # meters
     radial_velocity: float # m/s
-    vx_gt: float     # m/s
-    vy_gt: float     # m/s
-    vz_gt: float     # m/s
+    vx_gt: float     # m/s (In RADAR coordinates)
+    vy_gt: float     # m/s (In RADAR coordinates)
+    vz_gt: float     # m/s (In RADAR coordinates)
+    
+    # --- ADD THESE 3 LINES ---
+    vx_gt_world: float # m/s (In WORLD coordinates)
+    vy_gt_world: float # m/s (In WORLD coordinates)
+    vz_gt_world: float # m/s (In WORLD coordinates)
     noise_type: NoiseType
     # --- Data for internal logic ---
     pixel_uv: Tuple[float, float]
-    world_location: carla.Location
+    world_location: carla.Vector3D
     object_type: ObjectType
 
 
@@ -85,7 +90,7 @@ def radar_to_camera_projection(
     world: carla.World,
     ego_vehicle_id: int,
     ego_vehicle_velocity: carla.Vector3D # <-- NEW ARGUMENT
-) -> List[RadarPoint]:
+) -> Tuple[List[RadarPoint], int]:
     """
     Project REAL radar points to camera image plane and find their true 3D velocity.
     """
@@ -96,25 +101,17 @@ def radar_to_camera_projection(
     T_camera_world_matrix: List[List[float]] = T_world_camera.get_inverse_matrix()
     T_world_radar: carla.Transform = radar_transform
     M: List[List[float]] = T_camera_world_matrix
-    
-    actor_velocity_cache: Dict[int, Tuple[carla.Vector3D, ObjectType]] = {}
-    
+        
     img_height, img_width = instance_image.shape[:2]
-    
-    # --- *** START OF FIX *** ---
-    # Get the inverse transform matrix as a numpy array
-    T_world_radar_inv_np = np.array(T_world_radar.get_inverse_matrix())
-    # Get the 3x3 inverse rotation matrix
-    R_world_radar_inv_np = T_world_radar_inv_np[:3, :3]
-    # --- *** END OF FIX *** ---
 
+    mistag_count: int = 0  # <-- 1. INITIALIZE COUNTER
 
     for d in radar_data:
         local_x: float = d.depth * np.cos(d.altitude) * np.cos(d.azimuth)
         local_y: float = d.depth * np.cos(d.altitude) * np.sin(d.azimuth)
         local_z: float = d.depth * np.sin(d.altitude)
-        p_radar_local: carla.Location = carla.Location(x=local_x, y=local_y, z=local_z)
-        p_world: carla.Location = T_world_radar.transform(p_radar_local)
+        p_radar_local: carla.Vector3D = carla.Vector3D(x=local_x, y=local_y, z=local_z)
+        p_world: carla.Vector3D = T_world_radar.transform(p_radar_local)
         
         x_cam: float = M[0][0]*p_world.x + M[0][1]*p_world.y + M[0][2]*p_world.z + M[0][3]
         y_cam: float = M[1][0]*p_world.x + M[1][1]*p_world.y + M[1][2]*p_world.z + M[1][3]
@@ -131,7 +128,11 @@ def radar_to_camera_projection(
             v_int: int = int(round(pixel_v))
 
             if (0 <= u_int < img_width) and (0 <= v_int < img_height):
-                true_3d_velocity = carla.Vector3D(0.0, 0.0, 0.0)
+                true_3d_velocity_world = carla.Vector3D(0.0, 0.0, 0.0)
+                # We get the raw 3x3 rotation matrix
+                R_rad_from_world_np = np.array(
+                    radar_transform.get_inverse_matrix()
+                )[:3, :3]
                 object_type = ObjectType.STATIC
                 
                 b_val = int(instance_image[v_int, u_int, 0])
@@ -139,39 +140,36 @@ def radar_to_camera_projection(
                 object_id: int = (b_val * 256) + g_val
                 
                 if object_id != 0 and object_id != ego_vehicle_id:
-                    if object_id in actor_velocity_cache:
-                        true_3d_velocity, object_type = actor_velocity_cache[object_id]
-                    else:
-                        actor: Optional[carla.Actor] = world.get_actor(object_id)
-                        if actor:
-                            if 'vehicle' in actor.type_id or 'walker' in actor.type_id:
-                                true_3d_velocity = actor.get_velocity()
-                                object_type = ObjectType.ACTOR
-                            
-                            actor_velocity_cache[object_id] = (true_3d_velocity, object_type)
-                
-                # --- *** START OF FIX *** ---
-                
-                if d.depth > 0:
-                    unit_vector_local = p_radar_local / d.depth
-                else:
-                    unit_vector_local = carla.Vector3D(1.0, 0, 0)
-                
-                relative_velocity_world = true_3d_velocity - ego_vehicle_velocity
+                    actor: Optional[carla.Actor] = world.get_actor(object_id)
+                    if actor:
+                        if 'vehicle' in actor.type_id or 'walker' in actor.type_id:
+                            true_3d_velocity_world = actor.get_velocity()
+                            object_type = ObjectType.ACTOR
 
-                # --- BUG FIX IS HERE ---
-                # Convert to numpy and manually apply 3x3 inverse rotation
-                v_rel_world_np = np.array([relative_velocity_world.x, 
-                                           relative_velocity_world.y, 
-                                           relative_velocity_world.z])
-                v_rel_local_np = R_world_radar_inv_np @ v_rel_world_np
-                relative_velocity_local = carla.Vector3D(x=v_rel_local_np[0], 
-                                                         y=v_rel_local_np[1], 
-                                                         z=v_rel_local_np[2])
+                # 2. Convert GT velocity from Carla World to Carla Radar
+                vel_world_np = np.array([
+                    true_3d_velocity_world.x, 
+                    true_3d_velocity_world.y, 
+                    true_3d_velocity_world.z
+                ])
+                vel_radar_np = R_rad_from_world_np @ vel_world_np
                 
-                correct_radial_velocity = - (relative_velocity_local.dot(unit_vector_local))
+                # 3. Store the (Carla Radar) velocity
+                vx_gt_carla_radar = vel_radar_np[0]
+                vy_gt_carla_radar = vel_radar_np[1]
+                vz_gt_carla_radar = vel_radar_np[2]
                 
-                # --- *** END OF FIX *** ---
+                ego_speed_m_s = ego_vehicle_velocity.length() 
+                
+                if object_type == ObjectType.STATIC and ego_speed_m_s > 0.1:
+                    epsilon = 0.01
+                    
+                    carla_gt_v_rad = d.velocity
+                    
+                    if abs(carla_gt_v_rad) > ego_speed_m_s + epsilon:
+                        mistag_count += 1  # <-- 2. INCREMENT COUNTER
+                        # print(f"--- WARNING: VELOCITY CHECK FAILED (Carla's GT) ---")
+                        # print(f"  Frame: {radar_data.frame}")
 
                 projected_points.append(
                     RadarPoint(
@@ -182,16 +180,20 @@ def radar_to_camera_projection(
                         azimuth=d.azimuth,
                         elevation=d.altitude,
                         range=d.depth,
-                        radial_velocity=correct_radial_velocity,
-                        vx_gt=true_3d_velocity.x,
-                        vy_gt=true_3d_velocity.y,
-                        vz_gt=true_3d_velocity.z,
+                        radial_velocity=d.velocity,
+                        vx_gt=vx_gt_carla_radar,   # (Carla Radar Coords)
+                        vy_gt=vy_gt_carla_radar,   # (Carla Radar Coords)
+                        vz_gt=vz_gt_carla_radar,   # (Carla Radar Coords)
+                        # (true_3d_velocity_world is from actor.get_velocity())
+                        vx_gt_world=true_3d_velocity_world.x, # (Carla World Coords)
+                        vy_gt_world=true_3d_velocity_world.y, # (Carla World Coords)
+                        vz_gt_world=true_3d_velocity_world.z, # (Carla World Coords)
                         world_location=p_world,
                         noise_type=NoiseType.REAL,
                         object_type=object_type
                     )
                 )
-    return projected_points
+    return projected_points, mistag_count
 
 # --- MODIFIED: generate_multipath_points (BUG FIX) ---
 def generate_multipath_points(
@@ -213,11 +215,6 @@ def generate_multipath_points(
     
     K: NDArray[np.float32] = camera_intrinsics 
     img_height, img_width = K[1, 2] * 2, K[0, 2] * 2
-    
-    # --- *** START OF FIX *** ---
-    # Get the 3x3 inverse rotation matrix
-    R_world_camera_inv_np = T_camera_world_matrix_np[:3, :3]
-    # --- *** END OF FIX *** ---
 
     for real_point in real_points:
         if real_point.object_type == ObjectType.ACTOR:
@@ -248,25 +245,6 @@ def generate_multipath_points(
                 ghost_azimuth = float(np.arctan2(local_y, local_x))
                 ghost_elevation = float(np.arcsin(local_z / ghost_range))
                 
-                # --- *** START OF FIX FOR GHOST RADIAL VELOCITY *** ---
-                true_3d_velocity = carla.Vector3D(real_point.vx_gt, real_point.vy_gt, real_point.vz_gt)
-                relative_velocity_world = true_3d_velocity - ego_vehicle_velocity
-                
-                # --- BUG FIX IS HERE ---
-                # Convert to numpy and manually apply 3x3 inverse rotation
-                v_rel_world_np = np.array([relative_velocity_world.x, 
-                                           relative_velocity_world.y, 
-                                           relative_velocity_world.z])
-                v_rel_local_np = R_world_camera_inv_np @ v_rel_world_np
-                relative_velocity_local = carla.Vector3D(x=v_rel_local_np[0], 
-                                                         y=v_rel_local_np[1], 
-                                                         z=v_rel_local_np[2])
-
-                unit_vector_local_ghost = carla.Vector3D(local_x, local_y, local_z) / ghost_range
-
-                ghost_radial_velocity = - (relative_velocity_local.dot(unit_vector_local_ghost))
-                # --- *** END OF FIX *** ---
-
                 x_cam: float = M[0][0]*p_virtual_world.x + M[0][1]*p_virtual_world.y + M[0][2]*p_virtual_world.z + M[0][3]
                 y_cam: float = M[1][0]*p_virtual_world.x + M[1][1]*p_virtual_world.y + M[1][2]*p_virtual_world.z + M[1][3]
                 z_cam: float = M[2][0]*p_virtual_world.x + M[2][1]*p_virtual_world.y + M[2][2]*p_virtual_world.z + M[2][3]
@@ -287,10 +265,13 @@ def generate_multipath_points(
                                 azimuth=ghost_azimuth,
                                 elevation=ghost_elevation,
                                 range=ghost_range,
-                                radial_velocity=ghost_radial_velocity,
+                                radial_velocity=real_point.radial_velocity,
                                 vx_gt=real_point.vx_gt,
                                 vy_gt=real_point.vy_gt,
                                 vz_gt=real_point.vz_gt,
+                                vx_gt_world=real_point.vx_gt_world,
+                                vy_gt_world=real_point.vy_gt_world,
+                                vz_gt_world=real_point.vz_gt_world,
                                 world_location=p_virtual_world,
                                 noise_type=NoiseType.MULTIPATH,
                                 object_type=real_point.object_type
@@ -301,6 +282,78 @@ def generate_multipath_points(
                 pass
                 
     return ghost_points
+
+def save_debug_image(
+    filepath: str, 
+    image_data: carla.Image, 
+    points: List[RadarPoint],
+    vel_color_map: Dict[Tuple[float, float, float], str],
+    color_cycle: List[str],
+    ghost_color: str,
+    static_color: str
+) -> None:
+    """
+    Saves a debug image with radar points plotted on it,
+    color-coded by 3D ground truth velocity.
+    """
+    try:
+        # 1. Process the RGB image
+        img_rgb: NDArray[np.uint8] = process_image(image_data)
+        img_height, img_width = img_rgb.shape[:2]
+        
+        # 2. Create a Matplotlib figure
+        fig, ax = plt.subplots(figsize=(img_width / 100, img_height / 100), dpi=100)
+        ax.imshow(img_rgb)
+        
+        # 3. Collect points and colors
+        plot_points_2d: List[Tuple[float, float]] = []
+        plot_colors: List[str] = []
+        
+        if points:
+            for p in points:
+                plot_points_2d.append(p.pixel_uv)
+                
+                # --- START: NEW COLOR LOGIC ---
+                color = ''
+                if p.noise_type == NoiseType.MULTIPATH:
+                    color = ghost_color
+                else:
+                    # It's a REAL point, color by 3D velocity
+                    v_tuple = (round(p.vx_gt, 2), round(p.vy_gt, 2), round(p.vz_gt, 2))
+                    
+                    if v_tuple == (0.0, 0.0, 0.0):
+                        color = static_color
+                    elif v_tuple in vel_color_map:
+                        color = vel_color_map[v_tuple]
+                    else:
+                        # New velocity, assign a new color
+                        new_color_index = len(vel_color_map) % len(color_cycle)
+                        color = color_cycle[new_color_index]
+                        # The map is mutable, so this change will persist
+                        # back in the main() function's dictionary.
+                        vel_color_map[v_tuple] = color
+                
+                plot_colors.append(color)
+                # --- END: NEW COLOR LOGIC ---
+            
+            ax.scatter(
+                [uv[0] for uv in plot_points_2d], 
+                [uv[1] for uv in plot_points_2d], 
+                s=5, 
+                c=plot_colors,
+                alpha=0.7
+            )
+
+        # 4. Save the figure
+        ax.set_title(f"Frame {image_data.frame} - {len(points)} points")
+        ax.set_axis_off()
+        fig.savefig(filepath, dpi=150, bbox_inches='tight', pad_inches=0)
+        
+        # 5. Close the figure to free memory
+        plt.close(fig)
+        
+    except Exception as e:
+        print(f"Error saving debug image: {e}")
 
 # --- NEW: Function to save ego velocity ---
 def save_ego_velocity(filepath: str, vehicle: carla.Actor) -> None:
@@ -335,6 +388,9 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
             f.write("property float vx_gt\n")
             f.write("property float vy_gt\n")
             f.write("property float vz_gt\n")
+            f.write("property float vx_gt_world\n")
+            f.write("property float vy_gt_world\n")
+            f.write("property float vz_gt_world\n")
             f.write("property int noise_type\n")
             f.write("end_header\n")
             
@@ -344,10 +400,81 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
                         f"{p.azimuth} {p.elevation} {p.range} "
                         f"{p.radial_velocity} "
                         f"{p.vx_gt} {p.vy_gt} {p.vz_gt} "
+                        f"{p.vx_gt_world} {p.vy_gt_world} {p.vz_gt_world} "
                         f"{p.noise_type.value}\n")
                 
     except Exception as e:
         print(f"Error saving PLY file: {e}")
+
+def transform_points_to_paper_coords(
+    points: List[RadarPoint]
+) -> List[RadarPoint]:
+    """
+    Transforms the coordinate systems of a list of RadarPoint objects
+    from Carla's conventions (X-Fwd, Y-Right, Z-Up)
+    to the paper's conventions (Z-fwd, Y-down, X-right).
+    """
+    transformed_points: List[RadarPoint] = []
+    for p in points:
+        # 1. Transform Local Sensor Coordinates (Carla Sensor -> Paper Sensor)
+        # Carla Sensor: +X Fwd, +Y Right, +Z Up
+        # Paper Sensor: +X Right, +Y Down, +Z Fwd
+        paper_local_x = p.local_y   # Paper X (Right) = Carla Y (Right)
+        paper_local_y = -p.local_z  # Paper Y (Down)  = -Carla Z (Up)
+        paper_local_z = p.local_x   # Paper Z (Fwd)   = Carla X (Fwd)
+        
+        # 2. Transform World Ground Truth Velocity (Carla World -> Paper World)
+        # Carla World: +X Fwd, +Y Right, +Z Up
+        # Paper World: +X Right, +Y Down, +Z Fwd
+        paper_vx_gt = p.vy_gt       # Paper VX (Right) = Carla VY (Right)
+        paper_vy_gt = -p.vz_gt      # Paper VY (Down)  = -Carla VZ (Up)
+        paper_vz_gt = p.vx_gt       # Paper VZ (Fwd)   = Carla VX (Fwd)
+
+        # 3. Transform GT World Velocity (Carla World -> Paper World) ---
+        # Carla World: +X Fwd, +Y Right, +Z Up
+        # Paper World: +X Right, +Y Down, +Z Fwd
+        # (This also uses the same transform)
+        paper_vx_gt_world = p.vy_gt_world   # Paper X (Right) = Carla Y (Right)
+        paper_vy_gt_world = -p.vz_gt_world  # Paper Y (Down)  = -Carla Z (Up)
+        paper_vz_gt_world = p.vx_gt_world   # Paper Z (Fwd)   = Carla X (Fwd)
+
+        # 4. Re-calculate Azimuth and Elevation for the new system
+        # In the paper's Z-fwd, X-right, Y-down system:
+        # Azimuth is rotation around Y-axis: atan2(x, z)
+        # Elevation is rotation around X-axis: asin(y / range)
+        
+        paper_azimuth: float
+        paper_elevation: float
+        
+        if p.range > 1e-6: # Avoid division by zero
+            paper_azimuth = math.atan2(paper_local_x, paper_local_z)
+            asin_arg = max(-1.0, min(1.0, paper_local_y / p.range))
+            paper_elevation = math.asin(asin_arg)
+        else:
+            paper_azimuth = 0.0
+            paper_elevation = 0.0
+
+        # 4. Create a new RadarPoint with all transformed values
+        transformed_points.append(RadarPoint(
+            pixel_uv=p.pixel_uv,
+            local_x=paper_local_x,   # <-- Transformed
+            local_y=paper_local_y,   # <-- Transformed
+            local_z=paper_local_z,   # <-- Transformed
+            azimuth=paper_azimuth,     # <-- Re-calculated
+            elevation=paper_elevation, # <-- Re-calculated
+            range=p.range,           # <-- Unchanged scalar
+            radial_velocity=p.radial_velocity, # <-- Unchanged scalar
+            vx_gt=paper_vx_gt,       # <-- Transformed
+            vy_gt=paper_vy_gt,       # <-- Transformed
+            vz_gt=paper_vz_gt,       # <-- Transformed
+            vx_gt_world=paper_vx_gt_world,
+            vy_gt_world=paper_vy_gt_world,
+            vz_gt_world=paper_vz_gt_world,
+            world_location=p.world_location, 
+            noise_type=p.noise_type,
+            object_type=p.object_type
+        ))
+    return transformed_points
 
 
 def main() -> None:
@@ -365,9 +492,26 @@ def main() -> None:
     OUTPUT_DIR = "output"
     VEL_DIR = os.path.join(OUTPUT_DIR, "velocities")
     PLY_DIR = os.path.join(OUTPUT_DIR, "radar_ply")
+    CAM_DIR = os.path.join(OUTPUT_DIR, "camera_rgb")
+    DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
+    CALIB_DIR = os.path.join(OUTPUT_DIR, "calib")
+    POSES_DIR = os.path.join(OUTPUT_DIR, "poses")
     
     os.makedirs(VEL_DIR, exist_ok=True)
     os.makedirs(PLY_DIR, exist_ok=True)
+    os.makedirs(CAM_DIR, exist_ok=True)
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    os.makedirs(POSES_DIR, exist_ok=True)
+
+    # Color definitions for debug images
+    global_velocity_to_color_map: Dict[Tuple[float, float, float], str] = {}
+    color_cycle_list: List[str] = [
+        '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#00FFFF',
+        '#FF00FF', '#FFA500', '#800080', '#FFC0CB', '#008000'
+    ]
+    MULTIPATH_COLOR = '#FF00FF' # Fuchsia / Magenta
+    STATIC_COLOR = '#FFFFFF'    # White
     
     try:
         # 1. Connect and get world
@@ -427,6 +571,49 @@ def main() -> None:
         print(f'Spawned sensor: {instance_camera.type_id}')
         K_instance: NDArray[np.float32] = build_camera_intrinsics(cam_w, cam_h, instance_cam_fov)
 
+        K_camera: NDArray[np.float32] = build_camera_intrinsics(cam_w, cam_h, cam_fov)
+
+        try:
+            # 1. Save Camera Intrinsics (K_camera)
+            intrinsics_path = os.path.join(CALIB_DIR, "intrinsics.txt")
+            np.savetxt(intrinsics_path, K_camera, fmt='%.6f')
+            print(f"Saved camera intrinsics to {intrinsics_path}")
+
+            # --- 2. Calculate and Save Extrinsics (T_A_to_R) ---
+            # We must save the extrinsics in the same "Paper" coordinate
+            # system as our poses and PLY files.
+            
+            # CoB matrix: Carla (Xf, Yr, Zu) -> Paper (Xr, Yd, Zf)
+            C_paper_from_carla = np.array([
+                [0, 1,  0, 0], # Paper X (Right) = Carla Y (Right)
+                [0, 0, -1, 0], # Paper Y (Down)  = -Carla Z (Up)
+                [1, 0,  0, 0], # Paper Z (Fwd)   = Carla X (Fwd)
+                [0, 0,  0, 1]
+            ], dtype=np.float32)
+            C_carla_from_paper = np.linalg.inv(C_paper_from_carla)
+
+            # Get the raw WORLD-TO-LOCAL poses from Carla
+            cam_pose_carla_np = np.array(camera.get_transform().get_inverse_matrix(), dtype=np.float32)
+            rad_pose_carla_np = np.array(radar.get_transform().get_inverse_matrix(), dtype=np.float32)
+
+            # Convert these poses to the Paper's coordinate system
+            cam_pose_paper_np = C_paper_from_carla @ cam_pose_carla_np @ C_carla_from_paper
+            rad_pose_paper_np = C_paper_from_carla @ rad_pose_carla_np @ C_carla_from_paper
+            
+            # Now, calculate the extrinsics using the formula from your coordinate_systems.md
+            # T_A_to_R = RadarPose @ inv(CamPose_A)
+            # This gives us the static transform from PaperCamera to PaperRadar
+            extrinsics_matrix = rad_pose_paper_np @ np.linalg.inv(cam_pose_paper_np)
+            
+            extrinsics_path = os.path.join(CALIB_DIR, "extrinsics_radar_from_camera.txt")
+            np.savetxt(extrinsics_path, extrinsics_matrix, fmt='%.8f')
+            print(f"Saved extrinsics (Radar from Camera) to {extrinsics_path}")
+
+        except Exception as e:
+            print(f"--- ERROR SAVING CALIBRATION ---")
+            print(e)
+            print("---------------------------------")
+
         # 7. Set up Synchronous Mode (using 20 FPS)
         settings: carla.WorldSettings = world.get_settings()
         settings.synchronous_mode = True
@@ -447,6 +634,8 @@ def main() -> None:
         # 9. Setup complete
         print("Setup complete. Running simulation to save data...")
         print("Press Ctrl+C in this terminal to stop.")
+
+        prev_cam_pose_paper: Optional[NDArray[np.float64]] = None
         
         # 10. Main simulation loop
         while True:
@@ -497,7 +686,9 @@ def main() -> None:
                 
                 ego_vehicle_velocity = vehicle.get_velocity()
                 
-                real_points: List[RadarPoint] = radar_to_camera_projection(
+                real_points: List[RadarPoint]
+                mistag_count: int
+                real_points, mistag_count = radar_to_camera_projection(
                     radar_data,
                     instance_camera,
                     K_instance,
@@ -507,6 +698,7 @@ def main() -> None:
                     ego_vehicle_id,
                     ego_vehicle_velocity
                 )
+                # --- END MODIFIED CALL ---
                 
                 ghost_points: List[RadarPoint] = generate_multipath_points(
                     real_points,
@@ -518,16 +710,71 @@ def main() -> None:
                 
                 all_points = real_points + ghost_points
                 
-                # --- 12. NEW: Save data to disk ---
-                filename_id = f"{frame_id:08d}" 
+                # --- 12. Save data to disk ---
+                filename_id = f"{frame_id:08d}"
+
+                cam_filepath = os.path.join(CAM_DIR, f"{filename_id}.png")
+                image_data.save_to_disk(cam_filepath)
+
+                # Save Debug Image
+                debug_filepath = os.path.join(DEBUG_DIR, f"{filename_id}.png")
+                save_debug_image(
+                    debug_filepath, 
+                    image_data, 
+                    all_points,
+                    global_velocity_to_color_map,
+                    color_cycle_list,
+                    MULTIPATH_COLOR,
+                    STATIC_COLOR
+                )
                 
                 vel_filepath = os.path.join(VEL_DIR, f"{filename_id}.txt")
                 save_ego_velocity(vel_filepath, vehicle)
                 
+                # transformed coordinate system for further processing
+                final_points_for_ply = transform_points_to_paper_coords(all_points)
                 ply_filepath = os.path.join(PLY_DIR, f"{filename_id}.ply")
-                save_radar_ply(ply_filepath, all_points)
+                save_radar_ply(ply_filepath, final_points_for_ply)
+
+                try:
+                    # --- 1. Define the Change of Basis (CoB) matrices ---
+                    C_paper_from_carla = np.array([
+                        [0, 1,  0, 0], # Paper X (Right) = Carla Y (Right)
+                        [0, 0, -1, 0], # Paper Y (Down)  = -Carla Z (Up)
+                        [1, 0,  0, 0], # Paper Z (Fwd)   = Carla X (Fwd)
+                        [0, 0,  0, 1]
+                    ], dtype=np.float32)
+                    C_carla_from_paper = np.linalg.inv(C_paper_from_carla)
+
+                    # --- 2. Get CURRENT poses in Paper's system ---
+                    # T_CarlaCam_from_CarlaWorld
+                    cam_pose_carla_np = np.array(camera.get_transform().get_inverse_matrix(), dtype=np.float32)
+                    # T_PaperCam_from_PaperWorld (This is "Pose_B")
+                    curr_cam_pose_paper = C_paper_from_carla @ cam_pose_carla_np @ C_carla_from_paper
+
+                    # --- 3. Calculate and Save the "diff" (T_A_to_B) ---
+                    if prev_cam_pose_paper is not None:
+                        # This is "Pose_A"
+                        Pose_A = prev_cam_pose_paper 
+                        # This is "Pose_B"
+                        Pose_B = curr_cam_pose_paper
+                        
+                        # T_A_to_B = Pose_B @ inv(Pose_A)
+                        relative_pose_matrix = Pose_B @ np.linalg.inv(Pose_A)
+                        
+                        # Save the relative pose
+                        rel_pose_path = os.path.join(POSES_DIR, f"{filename_id}_relative_pose.txt")
+                        np.savetxt(rel_pose_path, relative_pose_matrix, fmt='%.8f')
+                    
+                    # --- 4. Store the current pose for the NEXT frame ---
+                    prev_cam_pose_paper = curr_cam_pose_paper
+
+                except Exception as e:
+                    print(f"--- ERROR SAVING POSES for frame {frame_id} ---")
+                    print(e)
+                # --- END: SAVE POSES ---
                 
-                print(f"Frame {frame_id}: Saved {len(all_points)} points ({len(real_points)} real, {len(ghost_points)} ghost)")
+                print(f"Frame {frame_id}: Saved {len(all_points)} points ({len(real_points)} real, {len(ghost_points)} ghost). Mis-tags: {mistag_count}")
 
             except queue.Empty:
                 # This will now only happen if the server is truly stuck (5+ seconds)
