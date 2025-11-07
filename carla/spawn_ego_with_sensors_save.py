@@ -146,11 +146,15 @@ def radar_to_camera_projection(
                             true_3d_velocity_world = actor.get_velocity()
                             object_type = ObjectType.ACTOR
 
+               # 1. Calculate the object's velocity RELATIVE to the ego vehicle in world coords
+                relative_velocity_world = true_3d_velocity_world - ego_vehicle_velocity
+
                 # 2. Convert GT velocity from Carla World to Carla Radar
+                #    (Use the new relative_velocity_world)
                 vel_world_np = np.array([
-                    true_3d_velocity_world.x, 
-                    true_3d_velocity_world.y, 
-                    true_3d_velocity_world.z
+                    relative_velocity_world.x, 
+                    relative_velocity_world.y, 
+                    relative_velocity_world.z
                 ])
                 vel_radar_np = R_rad_from_world_np @ vel_world_np
                 
@@ -392,6 +396,7 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
             f.write("property float vy_gt_world\n")
             f.write("property float vz_gt_world\n")
             f.write("property int noise_type\n")
+            f.write("property int object_type\n")
             f.write("end_header\n")
             
             # Write data
@@ -401,7 +406,7 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
                         f"{p.radial_velocity} "
                         f"{p.vx_gt} {p.vy_gt} {p.vz_gt} "
                         f"{p.vx_gt_world} {p.vy_gt_world} {p.vz_gt_world} "
-                        f"{p.noise_type.value}\n")
+                        f"{p.noise_type.value} {p.object_type.value}\n")
                 
     except Exception as e:
         print(f"Error saving PLY file: {e}")

@@ -23,7 +23,8 @@ class RadarDetection:
     velocity_gt_radar: np.ndarray # 3D (vx,vy,vz) in RADAR coords (Paper system)
     noise_type: NoiseType
     # We also load the world GT for visualization, but don't use it in the solver
-    velocity_gt_world: np.ndarray 
+    velocity_gt_world: np.ndarray
+    object_type: int
 
 # --- NEW: Mock Camera object for the solver ---
 class MockCamera:
@@ -75,13 +76,15 @@ def load_radar_ply(ply_path: str) -> List[RadarDetection]:
             vel_gt_radar = np.array([row[7], row[8], row[9]], dtype=np.float32)
             vel_gt_world = np.array([row[10], row[11], row[12]], dtype=np.float32)
             noise_type = NoiseType(int(row[13]))
+            object_type = int(row[14])
             
             detections.append(RadarDetection(
                 position_local=pos_local,
                 radial_velocity=v_rad,
                 velocity_gt_radar=vel_gt_radar,
                 noise_type=noise_type,
-                velocity_gt_world=vel_gt_world
+                velocity_gt_world=vel_gt_world,
+                object_type=object_type
             ))
         return detections
     except Exception as e:
@@ -113,6 +116,9 @@ def estimate_velocities_from_data(
 
     # 3. Process each detection
     for detection in radar_detections:
+        if detection.object_type == 0: 
+            continue # SKIP ALL STATIC POINTS
+
         point_radar_coords = detection.position_local
         speed_radial = detection.radial_velocity
         noiseType = detection.noise_type
@@ -175,6 +181,7 @@ def estimate_velocities_from_data(
                     velocity_error_magnitude = float(np.linalg.norm(
                         full_vel_vector_radar - ground_truth_vel_radar
                     ))
+                    # print(f"vel_radar: {full_vel_vector_radar}, vel_gt: {ground_truth_vel_radar}, flow: {flow[yq_pix, xq_pix]}")
                     frame_results.append((full_vel_magnitude, 
                                           velocity_error_magnitude, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
@@ -230,24 +237,27 @@ if __name__ == "__main__":
         
     max_frames = len(all_image_files)
 
+    # "Prime" the optical flow calculator with the first frame (Frame 0)
+    try:
+        frame_0_rgb = cv2.cvtColor(cv2.imread(all_image_files[0]), cv2.COLOR_BGR2RGB)
+        optical_flow_calculator.inference_cv(frame_0_rgb) # This just stores Frame 0
+    except Exception as e:
+        print(f"Error loading initial frame {all_image_files[0]}: {e}")
+        sys.exit(1)
+
     for frame_count in range(1, max_frames):
         
-        # --- A. Get File Paths ---
+        # We only need the files for the CURRENT frame (B)
         image_path_B = all_image_files[frame_count]
-        image_path_A = all_image_files[frame_count - 1]
-        
         frame_id_B = os.path.basename(image_path_B).split('.')[0]
-        frame_id_A = os.path.basename(image_path_A).split('.')[0]
 
-        # --- FIX: Load the correct files based on your plan ---
         pose_file_relative = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
-        ply_file_A = os.path.join(PLY_DIR, f"{frame_id_A}.ply")
+        ply_file_B = os.path.join(PLY_DIR, f"{frame_id_B}.ply")
         
         required_files = [
-            image_path_A, image_path_B, 
-            pose_file_relative, ply_file_A
+            image_path_B, 
+            pose_file_relative, ply_file_B
         ]
-        # --- End ---
 
         if not all(os.path.exists(f) for f in required_files):
             print(f"Warning: Missing one or more files for frame {frame_id_B}. Skipping.")
@@ -256,21 +266,18 @@ if __name__ == "__main__":
         # --- B. Load all data from disk ---
         try:
             current_frame_rgb = cv2.cvtColor(cv2.imread(image_path_B), cv2.COLOR_BGR2RGB)
-            prev_frame_rgb = cv2.cvtColor(cv2.imread(image_path_A), cv2.COLOR_BGR2RGB)
             
             # Load the "diff" (ego-motion)
             T_A_to_B = np.loadtxt(pose_file_relative)
             
-            # Load detections from Frame A
-            radar_detections: List[RadarDetection] = load_radar_ply(ply_file_A)
+            # Load detections from Frame B
+            radar_detections: List[RadarDetection] = load_radar_ply(ply_file_B)
             
         except Exception as e:
             print(f"Error loading data for frame {frame_id_B}: {e}. Skipping.")
             continue
 
-        # --- C. Run Algorithms ---
-        optical_flow_calculator.inference(prev_frame_rgb)
-        flow = optical_flow_calculator.inference(current_frame_rgb)
+        flow = optical_flow_calculator.inference_cv(current_frame_rgb)
         
         print(f"--- Frame {frame_count} ({frame_id_B}) ---")
         
