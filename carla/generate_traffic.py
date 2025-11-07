@@ -248,6 +248,7 @@ def main():
             if response.error:
                 logging.error(response.error)
             else:
+                print(response.actor_id)
                 vehicles_list.append(response.actor_id)
 
         # Set automatic vehicle lights update if specified

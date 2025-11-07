@@ -3,8 +3,10 @@ outputs/*
 *.ply
 *.npy
 *.png
+*.zip
 simulation/assets/
 simulation2/output/
+carla/output
 
 # Python
 __pycache__/
