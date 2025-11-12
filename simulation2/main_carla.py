@@ -116,8 +116,8 @@ def estimate_velocities_from_data(
 
     # 3. Process each detection
     for detection in radar_detections:
-        if detection.object_type == 0: 
-            continue # SKIP ALL STATIC POINTS
+        # if detection.object_type == 0: 
+        #     continue # SKIP ALL STATIC POINTS
 
         point_radar_coords = detection.position_local
         speed_radial = detection.radial_velocity
@@ -176,7 +176,7 @@ def estimate_velocities_from_data(
             )
              
             if frame_displacement_error is not None:
-                if noiseType == NoiseType.REAL:
+                if noiseType == NoiseType.REAL and detection.object_type == 1:
                     # --- FIX: Compare Radar-to-Radar ---
                     velocity_error_magnitude = float(np.linalg.norm(
                         full_vel_vector_radar - ground_truth_vel_radar
@@ -186,13 +186,13 @@ def estimate_velocities_from_data(
                                           velocity_error_magnitude, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_world)) # GT (World) for histogram
+                                          ground_truth_vel_radar)) # GT (World) for histogram
                 else:
                     frame_results.append((full_vel_magnitude, 
                                           0.0, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_world)) # GT (World) for histogram
+                                          ground_truth_vel_radar)) # GT (World) for histogram
             
     return frame_results
 
@@ -240,7 +240,7 @@ if __name__ == "__main__":
     # "Prime" the optical flow calculator with the first frame (Frame 0)
     try:
         frame_0_rgb = cv2.cvtColor(cv2.imread(all_image_files[0]), cv2.COLOR_BGR2RGB)
-        optical_flow_calculator.inference_cv(frame_0_rgb) # This just stores Frame 0
+        optical_flow_calculator.inference(frame_0_rgb) # This just stores Frame 0
     except Exception as e:
         print(f"Error loading initial frame {all_image_files[0]}: {e}")
         sys.exit(1)
@@ -277,7 +277,7 @@ if __name__ == "__main__":
             print(f"Error loading data for frame {frame_id_B}: {e}. Skipping.")
             continue
 
-        flow = optical_flow_calculator.inference_cv(current_frame_rgb)
+        flow = optical_flow_calculator.inference(current_frame_rgb)
         
         print(f"--- Frame {frame_count} ({frame_id_B}) ---")
         
@@ -304,8 +304,17 @@ if __name__ == "__main__":
                 )
                 
                 gt_real, gt_random, gt_multipath = 0, 0, 0
+                tp_pd_vectors = []
+                tp_gt_vectors = []
+
                 for det in current_frame_errors:
-                    if det[3] == NoiseType.REAL: gt_real += 1
+                    vel_3d_radar_PD = det[5]
+                    vel_3d_radar_GT = det[6]
+                    
+                    if det[3] == NoiseType.REAL: 
+                        gt_real += 1
+                        tp_pd_vectors.append(vel_3d_radar_PD)
+                        tp_gt_vectors.append(vel_3d_radar_GT)
                     elif det[3] == NoiseType.RANDOM_CLUTTER: gt_random += 1
                     elif det[3] == NoiseType.MULTIPATH_GHOST: gt_multipath += 1
                 
@@ -336,6 +345,35 @@ if __name__ == "__main__":
 
                 all_tp.append(tp); all_fp.append(total_fp); all_fn.append(fn); all_tn.append(total_tn)
 
+                # Helper function for safe percentage error
+                def safe_percent_error(actual, predicted, average_gt):
+                    # Use a small epsilon to avoid division by zero if actual is tiny
+                    epsilon = 1e-5 
+                    if abs(actual) < epsilon:
+                        if abs(predicted) < epsilon:
+                            return 0.0 # Both are effectively zero
+                        else:
+                            return 100.0 # Actual is zero, predicted is not
+                    
+                    error = abs(actual - predicted)
+                    return (error / (abs(average_gt) + epsilon)) * 100.0
+
+                if tp > 0:
+                    # Calculate mean vectors
+                    mean_pd_vec = np.mean(np.array(tp_pd_vectors), axis=0)
+                    mean_gt_vec = np.mean(np.array(tp_gt_vectors), axis=0)
+                    average_gt = float(np.linalg.norm(mean_gt_vec))
+                    
+                    # Calculate % error for each dimension
+                    err_x_pct = safe_percent_error(mean_gt_vec[0], mean_pd_vec[0], average_gt)
+                    err_y_pct = safe_percent_error(mean_gt_vec[1], mean_pd_vec[1], average_gt)
+                    err_z_pct = safe_percent_error(mean_gt_vec[2], mean_pd_vec[2], average_gt)
+                else:
+                    mean_pd_vec = np.array([0.0, 0.0, 0.0])
+                    mean_gt_vec = np.array([0.0, 0.0, 0.0])
+                    err_x_pct, err_y_pct, err_z_pct = 0.0, 0.0, 0.0
+                # --- END MODIFICATION ---
+
                 print(f"  Ground Truth: {total_real_points} Real | {total_noisy_points} Noisy (Random:{gt_random}, MP:{gt_multipath})")
                 print(f"  Algorithm Output: {len(clusters)} Clusters, {len(noise_points)} Noise Points")
                 print(f"  True Positives (TP):  {tp:4d} (Real points found)")
@@ -344,6 +382,10 @@ if __name__ == "__main__":
                 print(f"    - FP Random:    {fp_random:4d} (Filtered {tn_random}/{gt_random})")
                 print(f"    - FP Multipath: {fp_multipath:4d} (Filtered {tn_multipath}/{gt_multipath})")
                 print(f"  Precision: {precision * 100:6.2f}% | Recall: {recall * 100:6.2f}% | F1-Score: {f1 * 100:6.2f}%")
+                print(f"  --- TP Velocity Analysis (Mean) ---")
+                print(f"    GT (X,Y,Z): ({mean_gt_vec[0]:6.2f}, {mean_gt_vec[1]:6.2f}, {mean_gt_vec[2]:6.2f})")
+                print(f"    PD (X,Y,Z): ({mean_pd_vec[0]:6.2f}, {mean_pd_vec[1]:6.2f}, {mean_pd_vec[2]:6.2f})")
+                print(f"    % Err (X,Y,Z): ({err_x_pct:6.1f}%, {err_y_pct:6.1f}%, {err_z_pct:6.1f}%)")
                 print(f"--------------------------------------")
                 
                 fp_dict = {'random': fp_random, 'mp': fp_multipath}

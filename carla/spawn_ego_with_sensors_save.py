@@ -146,11 +146,11 @@ def radar_to_camera_projection(
                             true_3d_velocity_world = actor.get_velocity()
                             object_type = ObjectType.ACTOR
 
-               # 1. Calculate the object's velocity RELATIVE to the ego vehicle in world coords
+                # 1. Calculate the object's velocity RELATIVE to the ego vehicle in world coords
                 relative_velocity_world = true_3d_velocity_world - ego_vehicle_velocity
 
                 # 2. Convert GT velocity from Carla World to Carla Radar
-                #    (Use the new relative_velocity_world)
+                #    (Use the relative object's velocity)
                 vel_world_np = np.array([
                     relative_velocity_world.x, 
                     relative_velocity_world.y, 
@@ -162,6 +162,12 @@ def radar_to_camera_projection(
                 vx_gt_carla_radar = vel_radar_np[0]
                 vy_gt_carla_radar = vel_radar_np[1]
                 vz_gt_carla_radar = vel_radar_np[2]
+
+                if object_id != 0 and object_id != ego_vehicle_id:
+                    actor: Optional[carla.Actor] = world.get_actor(object_id)
+                    if actor:
+                        if 'vehicle' in actor.type_id or 'walker' in actor.type_id:
+                            print(f"true_3d_velocity_world: {true_3d_velocity_world}, radar_3d_velocity: {vel_radar_np}, ego_vehicle_velocity: {ego_vehicle_velocity}")
                 
                 ego_speed_m_s = ego_vehicle_velocity.length() 
                 
@@ -601,14 +607,12 @@ def main() -> None:
             cam_pose_carla_np = np.array(camera.get_transform().get_inverse_matrix(), dtype=np.float32)
             rad_pose_carla_np = np.array(radar.get_transform().get_inverse_matrix(), dtype=np.float32)
 
-            # Convert these poses to the Paper's coordinate system
-            cam_pose_paper_np = C_paper_from_carla @ cam_pose_carla_np @ C_carla_from_paper
-            rad_pose_paper_np = C_paper_from_carla @ rad_pose_carla_np @ C_carla_from_paper
-            
-            # Now, calculate the extrinsics using the formula from your coordinate_systems.md
-            # T_A_to_R = RadarPose @ inv(CamPose_A)
-            # This gives us the static transform from PaperCamera to PaperRadar
-            extrinsics_matrix = rad_pose_paper_np @ np.linalg.inv(cam_pose_paper_np)
+            # 2. Calculate extrinsics in CARLA's (LH) system
+            # This is T_CarlaRadar_from_CarlaCamera
+            extrinsics_carla_np = rad_pose_carla_np @ np.linalg.inv(cam_pose_carla_np)
+
+            # 3. NOW convert the final relative matrix to the "Paper" (RH) system
+            extrinsics_matrix = C_paper_from_carla @ extrinsics_carla_np @ C_carla_from_paper
             
             extrinsics_path = os.path.join(CALIB_DIR, "extrinsics_radar_from_camera.txt")
             np.savetxt(extrinsics_path, extrinsics_matrix, fmt='%.8f')
@@ -640,7 +644,7 @@ def main() -> None:
         print("Setup complete. Running simulation to save data...")
         print("Press Ctrl+C in this terminal to stop.")
 
-        prev_cam_pose_paper: Optional[NDArray[np.float64]] = None
+        prev_cam_pose_carla_np: Optional[NDArray[np.float32]] = None
         
         # 10. Main simulation loop
         while True:
@@ -751,28 +755,28 @@ def main() -> None:
                     ], dtype=np.float32)
                     C_carla_from_paper = np.linalg.inv(C_paper_from_carla)
 
-                    # --- 2. Get CURRENT poses in Paper's system ---
-                    # T_CarlaCam_from_CarlaWorld
-                    cam_pose_carla_np = np.array(camera.get_transform().get_inverse_matrix(), dtype=np.float32)
-                    # T_PaperCam_from_PaperWorld (This is "Pose_B")
-                    curr_cam_pose_paper = C_paper_from_carla @ cam_pose_carla_np @ C_carla_from_paper
+                    # 1. Get CURRENT pose in CARLA's native LH system
+                    curr_cam_pose_carla_np = np.array(camera.get_transform().get_inverse_matrix(), dtype=np.float32)
 
-                    # --- 3. Calculate and Save the "diff" (T_A_to_B) ---
-                    if prev_cam_pose_paper is not None:
-                        # This is "Pose_A"
-                        Pose_A = prev_cam_pose_paper 
-                        # This is "Pose_B"
-                        Pose_B = curr_cam_pose_paper
+                    # 3. Calculate and Save the "diff" (T_A_to_B)
+                    if prev_cam_pose_carla_np is not None:
+                        # 1. This is Pose_A in CARLA (LH) coords
+                        Pose_A_carla = prev_cam_pose_carla_np
+                        # 2. This is Pose_B in CARLA (LH) coords
+                        Pose_B_carla = curr_cam_pose_carla_np
                         
-                        # T_A_to_B = Pose_B @ inv(Pose_A)
-                        relative_pose_matrix = Pose_B @ np.linalg.inv(Pose_A)
+                        # 3. Calculate relative pose in CARLA's (LH) system
+                        relative_pose_carla = Pose_B_carla @ np.linalg.inv(Pose_A_carla)
+                        
+                        # 4. NOW convert the final relative matrix to "Paper" (RH) coords
+                        relative_pose_matrix = C_paper_from_carla @ relative_pose_carla @ C_carla_from_paper
                         
                         # Save the relative pose
                         rel_pose_path = os.path.join(POSES_DIR, f"{filename_id}_relative_pose.txt")
                         np.savetxt(rel_pose_path, relative_pose_matrix, fmt='%.8f')
                     
                     # --- 4. Store the current pose for the NEXT frame ---
-                    prev_cam_pose_paper = curr_cam_pose_paper
+                    prev_cam_pose_carla_np = curr_cam_pose_carla_np
 
                 except Exception as e:
                     print(f"--- ERROR SAVING POSES for frame {frame_id} ---")

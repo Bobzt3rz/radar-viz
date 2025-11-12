@@ -56,7 +56,7 @@ def cluster_detections_6d(
     final_clusters = []
     final_noise = []
 
-    debug = True
+    debug = False
     
     if(debug): print("--- [Clustering Debug] Multipath Point Classification ---")
 
