@@ -1,0 +1,11 @@
+# Python code snippet:
+K_paper = np.array([
+            [648.693424091034,   0.0,                374.317558900438], # fx, cx from [Source 9]
+            [  0.0,              649.20220267972,    266.516686668001], # fy, cy from [Source 9]
+            [  0.0,                0.0,                  1.0            ]
+        ], dtype=np.float64)
+
+r_cl_original = np.array([1.218118978578853, -1.206092029493519, 1.201848906050864])
+    
+# Original translation vector from CALIBRATION_CAMERA_LIDAR.txt
+t_cl_original = np.array([0.2347512330691049, -0.3165704095566238, -0.7598884687506345])

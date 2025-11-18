@@ -116,8 +116,9 @@ def estimate_velocities_from_data(
 
     # 3. Process each detection
     for detection in radar_detections:
-        # if detection.object_type == 0: 
-        #     continue # SKIP ALL STATIC POINTS
+        # filter for different object types here
+        if detection.object_type == 0: 
+            continue # SKIP ALL STATIC POINTS
 
         point_radar_coords = detection.position_local
         speed_radial = detection.radial_velocity
@@ -144,8 +145,9 @@ def estimate_velocities_from_data(
 
         if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
             continue
-
+        
         dx, dy = flow[yq_pix, xq_pix]
+  
         xp_pix_f = xq_pix_f - dx
         yp_pix_f = yq_pix_f - dy
 
@@ -159,6 +161,7 @@ def estimate_velocities_from_data(
             speed_radial=speed_radial, point_radar_coords=point_radar_coords,
             return_in_radar_coords=True
         )
+        
         
         if full_vel_vector_radar is not None:
             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
@@ -201,7 +204,7 @@ def estimate_velocities_from_data(
 if __name__ == "__main__":
 
     # --- 1. Define Paths and Constants ---
-    CARLA_OUTPUT_DIR = "../carla/output"
+    CARLA_OUTPUT_DIR = "../carla/output2"
     DELTA_T = 0.05 # 20 FPS
     
     CAM_DIR = os.path.join(CARLA_OUTPUT_DIR, "camera_rgb")
@@ -412,12 +415,12 @@ if __name__ == "__main__":
                         real_velocity_errors.append(vel_err)
                         real_displacement_errors.append(disp_err)
                         real_positions.append(pos_3d)
-                        real_velocities.append(vel_3d_world_gt) # Use world for histogram
+                        real_velocities.append(vel_3d_radar)
                     else:
                         noisy_vel_magnitudes.append(vel_mag)
                         noisy_displacement_errors.append(disp_err)
                         noisy_positions.append(pos_3d)
-                        noisy_velocities.append(vel_3d_world_gt) # Use world for histogram
+                        noisy_velocities.append(vel_3d_radar) # Use world for histogram
                 
                 all_real_velocity_abs_errors.extend(real_velocity_errors)
                 all_real_velocity_actual_magnitudes.extend(real_vel_magnitudes)

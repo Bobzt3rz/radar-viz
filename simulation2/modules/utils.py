@@ -219,7 +219,7 @@ def save_frame_histogram(
     else:
         ax.set_title("Noisy: Pred. Vel Mag vs. Disp. Error\n(No Data)")
 
-    # --- Row 2, Col 4: 3D Solved Velocity (World Coords) ---
+    # --- Row 2, Col 4: 3D Solved Velocity (Radar Coords) ---
     ax = axes[1, 3]
     ax.remove() # Remove the 2D axes
     ax_vel = fig.add_subplot(2, 4, 8, projection='3d') # Add 3D subplot
@@ -233,7 +233,7 @@ def save_frame_histogram(
         ax_vel.scatter(noisy_vel_np[:, 0], noisy_vel_np[:, 1], noisy_vel_np[:, 2], 
                        c='red', s=5, label=f'Noisy (N={len(noisy_vel_np)})', alpha=0.1)
 
-    ax_vel.set_title("3D Solved Velocity (World Coords)")
+    ax_vel.set_title("3D Solved Velocity (Radar Coords)")
     ax_vel.set_xlabel("Vx (m/s)")
     ax_vel.set_ylabel("Vy (m/s)")
     ax_vel.set_zlabel("Vz (m/s)")

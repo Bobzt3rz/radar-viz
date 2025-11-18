@@ -1,0 +1,25 @@
+# Camera Intrinsics (K matrix)
+fx = 638.7
+fy = 633.3
+cx = 380.3
+cy = 261.1
+
+# Rotation (Rodrigues vector)
+rx = 1.21
+ry = -1.21
+rz = 1.219
+
+# Translation (meters)
+tx = 0.234
+ty = -0.316
+tz = -0.759
+
+# Python code snippet:
+K = np.array([
+    [638.7, 0.0, 380.3],
+    [0.0, 633.3, 261.1],
+    [0.0, 0.0, 1.0]
+], dtype=np.float64)
+
+r_cl = np.array([1.21, -1.21, 1.219])
+t_cl = np.array([0.234, -0.316, -0.759])
