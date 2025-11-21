@@ -257,7 +257,9 @@ def calculate_reprojection_error(
     flow: FlowField,                      # Flow field
     camera: Camera,                       # Camera object for intrinsics
     xq_pix_f: float, yq_pix_f: float,     # Projected 3D radar point to image frame at t (B)
-    delta_t: float                        # Simulation time step
+    delta_t: float,                        # Simulation time step
+    depth: float,
+    noiseType: NoiseType
 ) -> Optional[float]:
     """
     Calculates the reprojection error using only relative transformations.
@@ -324,6 +326,93 @@ def calculate_reprojection_error(
     error_x = previous_xp_pred_pix_f - flow_previous_xp_pred_pix_f
     error_y = previous_yp_pred_pix_f - flow_previous_yp_pred_pix_f
 
-    reprojection_error = math.sqrt(error_x**2 + error_y**2)
+    absolute_reprojection_error = math.sqrt(error_x**2 + error_y**2)
 
-    return reprojection_error
+    # --- 6. NORMALIZE ---
+    # Calculate magnitude of the actual flow vector
+    flow_magnitude = math.sqrt(dx**2 + dy**2)
+    
+    # Use max(1.0, ...) to avoid division by zero for stationary objects.
+    # If flow is < 1 pixel, we treat the absolute error as the relative error.
+    normalized_error = absolute_reprojection_error / max(1.0, flow_magnitude)
+
+    angle_error = calculate_corrected_angle_error(full_vel_radar_A, point_radar_B, T_Cam_from_Radar, T_CamB_from_CamA, dx, dy, camera, delta_t)
+
+    return absolute_reprojection_error
+
+def calculate_corrected_angle_error(
+    full_vel_radar_A: Vector3,            
+    point_radar_A: Vector3, # Note: Input is Point at A (we predict B)
+    T_Cam_from_Radar: Matrix4x4,
+    T_CamB_from_CamA: Matrix4x4, # EGO MOTION
+    flow_dx: float,
+    flow_dy: float,
+    camera: Camera,
+    delta_t: float
+) -> float:
+    """
+    Calculates Angle Error accounting for both Object Velocity AND Ego-Motion.
+    """
+    # 1. Transform Point and Velocity to Camera A Frame
+    point_radar_A_h = np.append(point_radar_A, 1.0)
+    point_cam_A_h = T_Cam_from_Radar @ point_radar_A_h
+    point_cam_A = point_cam_A_h[:3]
+    
+    R_Cam_from_Radar = T_Cam_from_Radar[0:3, 0:3]
+    vel_cam_A = R_Cam_from_Radar @ full_vel_radar_A
+    
+    # 2. Predict Point at Time B (in Camera A Frame)
+    # Object Motion: P_new = P_old + V_obj * dt
+    point_cam_A_at_tB = point_cam_A + (vel_cam_A * delta_t)
+    
+    # 3. Transform to Camera B Frame (Apply Ego Motion)
+    # P_camB = T_B_from_A @ P_camA
+    point_cam_A_at_tB_h = np.append(point_cam_A_at_tB, 1.0)
+    point_cam_B_h = T_CamB_from_CamA @ point_cam_A_at_tB_h
+    point_cam_B = point_cam_B_h[:3]
+    
+    # 4. Project Start (A) and End (B) to pixels
+    # Start Pixel (Re-projecting A ensures we use the exact geometric center)
+    # Alternatively, you can use the 'pixel_u' passed in if it corresponds to A.
+    # But assuming flow is B->A or A->B, we need the vector.
+    
+    # Let's verify flow direction: usually Flow is A -> B.
+    # Current Pixel (at B) - Previous Pixel (at A) = (dx, dy)
+    
+    def project(p):
+        if p[2] < 0.1: return np.array([0,0])
+        u = p[0] / p[2]
+        v = p[1] / p[2]
+        return np.array([
+            camera.fx * u + camera.cx,
+            camera.fy * v + camera.cy
+        ])
+
+    # Project Prediction
+    pix_A_pred = project(point_cam_A) # Where it was
+    pix_B_pred = project(point_cam_B) # Where it is now (with Ego + Obj motion)
+    
+    expected_flow_vector = pix_B_pred - pix_A_pred
+    
+    # 5. Observed Flow
+    # NOTE: Verify if your flow is A->B (forward) or B->A (backward).
+    # If flow is "Current(B) - Previous(A)", then use as is.
+    observed_flow_vector = np.array([flow_dx, flow_dy])
+    
+    # 6. Calculate Angle
+    norm_exp = np.linalg.norm(expected_flow_vector)
+    norm_obs = np.linalg.norm(observed_flow_vector)
+    
+    # if norm_exp < 0.5 or norm_obs < 0.5:
+    #     return 0.0
+        
+    dot = np.dot(expected_flow_vector, observed_flow_vector)
+    cosine = np.clip(dot / (norm_exp * norm_obs), -1.0, 1.0)
+    angle = np.degrees(np.arccos(cosine))
+    
+    # 2. Weight by Observation Magnitude
+    # "How much visual evidence do we have for this angle?"
+    # We use observed flow because that's the "Ground Truth" of image motion.
+    weighted_error = angle * (norm_obs * np.linalg.norm(vel_cam_A))
+    
+    return weighted_error

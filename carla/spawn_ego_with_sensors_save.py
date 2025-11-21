@@ -44,12 +44,12 @@ class RadarPoint:
     vx_gt: float     # m/s (In RADAR coordinates)
     vy_gt: float     # m/s (In RADAR coordinates)
     vz_gt: float     # m/s (In RADAR coordinates)
-    
     # --- ADD THESE 3 LINES ---
     vx_gt_world: float # m/s (In WORLD coordinates)
     vy_gt_world: float # m/s (In WORLD coordinates)
     vz_gt_world: float # m/s (In WORLD coordinates)
     noise_type: NoiseType
+    actor_id: int  # Stores the CARLA Actor ID (e.g., 245) or 0 for background
     # --- Data for internal logic ---
     pixel_uv: Tuple[float, float]
     world_location: carla.Vector3D
@@ -146,6 +146,11 @@ def radar_to_camera_projection(
                             true_3d_velocity_world = actor.get_velocity()
                             object_type = ObjectType.ACTOR
 
+                if object_type == ObjectType.STATIC:
+                    final_saved_id = 0
+                else:
+                    final_saved_id = object_id
+
                 # 1. Calculate the object's velocity RELATIVE to the ego vehicle in world coords
                 relative_velocity_world = true_3d_velocity_world - ego_vehicle_velocity
 
@@ -200,7 +205,8 @@ def radar_to_camera_projection(
                         vz_gt_world=true_3d_velocity_world.z, # (Carla World Coords)
                         world_location=p_world,
                         noise_type=NoiseType.REAL,
-                        object_type=object_type
+                        object_type=object_type,
+                        actor_id=final_saved_id
                     )
                 )
     return projected_points, mistag_count
@@ -284,7 +290,8 @@ def generate_multipath_points(
                                 vz_gt_world=real_point.vz_gt_world,
                                 world_location=p_virtual_world,
                                 noise_type=NoiseType.MULTIPATH,
-                                object_type=real_point.object_type
+                                object_type=real_point.object_type,
+                                actor_id=real_point.actor_id
                             )
                         )
             except Exception as e:
@@ -293,6 +300,115 @@ def generate_multipath_points(
                 
     return ghost_points
 
+def generate_static_clutter(
+    camera: carla.Actor, # This is the co-located instance_camera
+    camera_intrinsics: NDArray[np.float32], # This is K_instance
+    radar_transform: carla.Transform,
+    ego_vehicle_velocity: carla.Vector3D,
+    radar_range: float,
+    radar_fov_horiz: float, # e.g., 70.0 degrees
+    radar_fov_vert: float,  # e.g., 40.0 degrees
+    points_to_generate: int = 1000,
+    velocity_std_dev: float = 0.3, # Standard deviation for velocity noise (m/s)
+) -> List[RadarPoint]:
+    """
+    Generates random clutter points (NoiseType.RANDOM) distributed in space 
+    with radial velocities centered around the expected radial velocity of static objects.
+    """
+    random_points: List[RadarPoint] = []
+    
+    T_world_radar = radar_transform
+
+    T_world_camera: carla.Transform = camera.get_transform()
+    T_camera_world_matrix_np = np.array(T_world_camera.get_inverse_matrix())
+    M: List[List[float]] = T_camera_world_matrix_np.tolist()
+    
+    K: NDArray[np.float32] = camera_intrinsics 
+    
+    # 1. Calculate Ego Velocity in numpy array form (Carla World Coordinates)
+    ego_vel_np = np.array([
+        ego_vehicle_velocity.x, 
+        ego_vehicle_velocity.y, 
+        ego_vehicle_velocity.z
+    ])
+    
+    # Convert FOV from degrees to radians
+    h_fov_rad = np.deg2rad(radar_fov_horiz)
+    v_fov_rad = np.deg2rad(radar_fov_vert)
+
+    for i in range(points_to_generate):
+        # 2. Generate random spherical coordinates within FOV
+        
+        # Range (distance from sensor)
+        r = random.uniform(5.0, radar_range) 
+        
+        # Azimuth (Yaw) is centered at 0 (forward)
+        az = random.uniform(-h_fov_rad / 2.0, h_fov_rad / 2.0)
+        
+        # Elevation (Pitch) is centered at 0
+        el = random.uniform(-v_fov_rad / 2.0, v_fov_rad / 2.0)
+        
+        # 3. Convert spherical to local radar cartesian coordinates
+        local_x = r * np.cos(el) * np.cos(az)
+        local_y = r * np.cos(el) * np.sin(az)
+        local_z = r * np.sin(el)
+        
+        p_radar_local = carla.Vector3D(x=local_x, y=local_y, z=local_z)
+        p_world: carla.Vector3D = T_world_radar.transform(p_radar_local)
+
+        # 4. Calculate Expected Radial Velocity (GT Static Velocity)
+        
+        # Direction vector (point-to-sensor): p_world -> T_world_radar.location
+        r_vector_world_carla = T_world_radar.location - p_world 
+        r_vector_world_np = np.array([
+            r_vector_world_carla.x, 
+            r_vector_world_carla.y, 
+            r_vector_world_carla.z
+        ])
+        
+        # Normalize direction vector (unit vector pointing from point to radar)
+        r_unit_np = r_vector_world_np / (np.linalg.norm(r_vector_world_np) + 1e-6)
+
+        # The velocity of a static point *P* relative to the moving ego sensor is 
+        # V_static_point_relative_to_radar = -V_ego
+        
+        # Expected radial velocity is the projection of -V_ego onto the unit vector r_unit
+        expected_radial_velocity_static = -float(np.dot(r_unit_np, ego_vel_np))
+        
+        # 5. Add Gaussian Noise
+        noisy_radial_velocity = expected_radial_velocity_static + random.gauss(0, velocity_std_dev)
+
+        x_cam: float = M[0][0]*p_world.x + M[0][1]*p_world.y + M[0][2]*p_world.z + M[0][3]
+        y_cam: float = M[1][0]*p_world.x + M[1][1]*p_world.y + M[1][2]*p_world.z + M[1][3]
+        z_cam: float = M[2][0]*p_world.x + M[2][1]*p_world.y + M[2][2]*p_world.z + M[2][3]
+
+        if x_cam > 0: 
+            u_norm: float = y_cam / x_cam
+            v_norm: float = -z_cam / x_cam
+            pixel_u: float = K[0, 0] * u_norm + K[0, 2]
+            pixel_v: float = K[1, 1] * v_norm + K[1, 2]
+            # 6. Create the RadarPoint
+            random_points.append(
+                RadarPoint(
+                    pixel_uv=(pixel_u, pixel_v),
+                    local_x=local_x,
+                    local_y=local_y,
+                    local_z=local_z,
+                    azimuth=az,
+                    elevation=el,
+                    range=r,
+                    radial_velocity=noisy_radial_velocity,
+                    vx_gt=0.0, vy_gt=0.0, vz_gt=0.0, # GT is 0.0 (relative to world)
+                    vx_gt_world=0.0, vy_gt_world=0.0, vz_gt_world=0.0, # This is false data
+                    world_location=p_world,
+                    noise_type=NoiseType.RANDOM,
+                    object_type=ObjectType.STATIC, # It mimics static clutter
+                    actor_id=0 # Assign ID 0 for generic static clutter
+                )
+        )
+            
+    return random_points
+
 def save_debug_image(
     filepath: str, 
     image_data: carla.Image, 
@@ -300,7 +416,8 @@ def save_debug_image(
     vel_color_map: Dict[Tuple[float, float, float], str],
     color_cycle: List[str],
     ghost_color: str,
-    static_color: str
+    static_color: str,
+    random_color: str
 ) -> None:
     """
     Saves a debug image with radar points plotted on it,
@@ -327,6 +444,8 @@ def save_debug_image(
                 color = ''
                 if p.noise_type == NoiseType.MULTIPATH:
                     color = ghost_color
+                elif p.noise_type == NoiseType.RANDOM:
+                    color = random_color
                 else:
                     # It's a REAL point, color by 3D velocity
                     v_tuple = (round(p.vx_gt, 2), round(p.vy_gt, 2), round(p.vz_gt, 2))
@@ -403,6 +522,7 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
             f.write("property float vz_gt_world\n")
             f.write("property int noise_type\n")
             f.write("property int object_type\n")
+            f.write("property int actor_id\n")
             f.write("end_header\n")
             
             # Write data
@@ -412,7 +532,8 @@ def save_radar_ply(filepath: str, points: List[RadarPoint]) -> None:
                         f"{p.radial_velocity} "
                         f"{p.vx_gt} {p.vy_gt} {p.vz_gt} "
                         f"{p.vx_gt_world} {p.vy_gt_world} {p.vz_gt_world} "
-                        f"{p.noise_type.value} {p.object_type.value}\n")
+                        f"{p.noise_type.value} {p.object_type.value} "
+                        f"{p.actor_id}\n")
                 
     except Exception as e:
         print(f"Error saving PLY file: {e}")
@@ -483,7 +604,8 @@ def transform_points_to_paper_coords(
             vz_gt_world=paper_vz_gt_world,
             world_location=p.world_location, 
             noise_type=p.noise_type,
-            object_type=p.object_type
+            object_type=p.object_type,
+            actor_id=p.actor_id
         ))
     return transformed_points
 
@@ -523,6 +645,7 @@ def main() -> None:
     ]
     MULTIPATH_COLOR = '#FF00FF' # Fuchsia / Magenta
     STATIC_COLOR = '#FFFFFF'    # White
+    RANDOM_COLOR = '#000000' # Black'
     
     try:
         # 1. Connect and get world
@@ -563,10 +686,12 @@ def main() -> None:
         # 5. Spawn Radar (using your settings)
         radar_bp: carla.ActorBlueprint = blueprint_library.find('sensor.other.radar')
         radar_fov_horiz: float = 70.0
+        radar_fov_vert: float = 40.0
+        radar_range: float = 100.0
         radar_bp.set_attribute('points_per_second', '15000')
         radar_bp.set_attribute('horizontal_fov', str(radar_fov_horiz))
-        radar_bp.set_attribute('vertical_fov', '40')
-        radar_bp.set_attribute('range', '150')
+        radar_bp.set_attribute('vertical_fov', str(radar_fov_vert))
+        radar_bp.set_attribute('range', str(radar_range))
         radar = world.spawn_actor(radar_bp, co_located_transform, attach_to=vehicle)
         actor_list.append(radar)
         print(f'Spawned sensor: {radar.type_id}')
@@ -717,7 +842,20 @@ def main() -> None:
                     ego_vehicle_velocity
                 )
                 
-                all_points = real_points + ghost_points
+                
+                random_clutter_points: List[RadarPoint] = generate_static_clutter(
+                    instance_camera,
+                    K_instance,
+                    radar_world_transform,
+                    ego_vehicle_velocity, 
+                    radar_range,
+                    radar_fov_horiz,
+                    radar_fov_vert,
+                    points_to_generate=500, # Adjust this number as needed
+                    velocity_std_dev=0.3 # Adjust this number as needed
+                )
+                
+                all_points = real_points + ghost_points + random_clutter_points
                 
                 # --- 12. Save data to disk ---
                 filename_id = f"{frame_id:08d}"
@@ -734,7 +872,8 @@ def main() -> None:
                     global_velocity_to_color_map,
                     color_cycle_list,
                     MULTIPATH_COLOR,
-                    STATIC_COLOR
+                    STATIC_COLOR,
+                    RANDOM_COLOR
                 )
                 
                 vel_filepath = os.path.join(VEL_DIR, f"{filename_id}.txt")

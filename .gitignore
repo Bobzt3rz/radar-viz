@@ -6,8 +6,10 @@ outputs/*
 *.zip
 simulation/assets/
 simulation2/output/
+simulation2/flow
 carla/output
 carla/output2
+carla/flow
 
 # Python
 __pycache__/

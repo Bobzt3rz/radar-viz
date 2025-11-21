@@ -14,8 +14,9 @@ FlowField = NDArray[np.float32]
 # note swap random/multipath enum if using opengl
 class NoiseType(Enum):
     REAL = 0              # A real point from an object
-    RANDOM_CLUTTER = 2    # Uniformly random noise
     MULTIPATH_GHOST = 1   # A "ghost" reflection of a real object
+    RANDOM_CLUTTER = 2    # Uniformly random noise
+    
 
-# (vel_mag, vel_err, disp_err, noise_type, pos_3d_radar, vel_3d_radar, vel_3d_world)
-DetectionTuple = Tuple[float, float, float, NoiseType, np.ndarray, np.ndarray, np.ndarray]
+# (vel_mag, vel_err, disp_err, noise_type, pos_3d_radar, vel_3d_radar, vel_3d_world, object_id)
+DetectionTuple = Tuple[float, float, float, NoiseType, np.ndarray, np.ndarray, np.ndarray, int]

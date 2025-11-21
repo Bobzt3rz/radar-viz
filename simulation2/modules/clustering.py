@@ -56,10 +56,6 @@ def cluster_detections_6d(
     final_clusters = []
     final_noise = []
 
-    debug = False
-    
-    if(debug): print("--- [Clustering Debug] Multipath Point Classification ---")
-
     unique_labels = set(labels)
     for k in unique_labels:
         indices = np.where(labels == k)[0]
@@ -70,24 +66,14 @@ def cluster_detections_6d(
                 det = detections[i]
                 final_noise.append(det)
                 
-                # --- DEBUG CHECK 1 ---
-                # Check if a multipath point was CORRECTLY filtered
-                if det[3] == NoiseType.MULTIPATH_GHOST and debug:
-                    print(f"  [MULTIPATH -> FILTERED (TN)] Pos: {np.round(det[4], 2)}, Vel: {np.round(det[5], 2)}")
         else:
             # This point was put into a CLUSTER
             cluster_group = []
             for i in indices:
                 det = detections[i]
                 cluster_group.append(det)
-                
-                # --- DEBUG CHECK 2 ---
-                # Check if a multipath point was INCORRECTLY clustered
-                if det[3] == NoiseType.MULTIPATH_GHOST and debug:
-                    print(f"  [MULTIPATH -> CLUSTERED (FP)] Pos: {np.round(det[4], 2)}, Vel: {np.round(det[5], 2)} -> Cluster {k}")
             
             final_clusters.append(cluster_group)
             
-    if(debug): print("---------------------------------------------------------")
             
     return final_clusters, final_noise

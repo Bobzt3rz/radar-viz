@@ -7,12 +7,11 @@ from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
 # --- Import all the original logic modules ---
-from modules.optical_flow import OpticalFlow
-from modules.utils import save_image, save_frame_histogram, save_clustering_analysis_plot
+from modules.utils import save_image, save_frame_histogram, save_clustering_analysis_plot, save_frame_histogram_by_object, save_cluster_survivor_analysis
 from modules.clustering import cluster_detections_6d
 from modules.types import NoiseType, DetectionTuple, Vector3, Matrix4x4, FlowField
 from modules.velocity_solver import solve_full_velocity, calculate_reprojection_error
-
+from modules.tracking import ClusterTracker
 
 # --- NEW: Define the dataclass that bridges PLY to solver ---
 @dataclass
@@ -25,6 +24,7 @@ class RadarDetection:
     # We also load the world GT for visualization, but don't use it in the solver
     velocity_gt_world: np.ndarray
     object_type: int
+    object_id: int
 
 # --- NEW: Mock Camera object for the solver ---
 class MockCamera:
@@ -63,7 +63,7 @@ def load_radar_ply(ply_path: str) -> List[RadarDetection]:
         data_lines = lines[header_end_index + 1:]
         if not data_lines: return [] 
 
-        # x, y, z, az, el, r, v_rad, vx_gt, vy_gt, vz_gt, vx_w, vy_w, vz_w, noise
+        # x, y, z, az, el, r, v_rad, vx_gt, vy_gt, vz_gt, vx_w, vy_w, vz_w, noise, object_type, object_id
         data_array = np.loadtxt(data_lines, dtype=np.float32)
 
         if data_array.ndim == 1:
@@ -77,6 +77,7 @@ def load_radar_ply(ply_path: str) -> List[RadarDetection]:
             vel_gt_world = np.array([row[10], row[11], row[12]], dtype=np.float32)
             noise_type = NoiseType(int(row[13]))
             object_type = int(row[14])
+            object_id = int(row[15])
             
             detections.append(RadarDetection(
                 position_local=pos_local,
@@ -84,7 +85,8 @@ def load_radar_ply(ply_path: str) -> List[RadarDetection]:
                 velocity_gt_radar=vel_gt_radar,
                 noise_type=noise_type,
                 velocity_gt_world=vel_gt_world,
-                object_type=object_type
+                object_type=object_type,
+                object_id=object_id
             ))
         return detections
     except Exception as e:
@@ -116,13 +118,10 @@ def estimate_velocities_from_data(
 
     # 3. Process each detection
     for detection in radar_detections:
-        # filter for different object types here
-        if detection.object_type == 0: 
-            continue # SKIP ALL STATIC POINTS
-
         point_radar_coords = detection.position_local
         speed_radial = detection.radial_velocity
         noiseType = detection.noise_type
+        object_id = detection.object_id
         # This is the GT we will compare against
         ground_truth_vel_radar = detection.velocity_gt_radar
         # This is just for visualization
@@ -154,14 +153,28 @@ def estimate_velocities_from_data(
         up = (xp_pix_f - camera.cx) / camera.fx
         vp = (yp_pix_f - camera.cy) / camera.fy
 
+        # need radial velocity in camera coordinate system
+        dist_radar = np.linalg.norm(point_radar_coords)
+        if dist_radar > 1e-3:
+            # Unit ray in Radar Frame
+            ray_radar = point_radar_coords / dist_radar 
+            # Full velocity vector in Radar Frame (assuming pure radial motion)
+            vel_vec_radar = ray_radar * speed_radial
+            # Rotate to Camera Frame
+            R_Cam_from_Radar = T_Cam_from_Radar_static[0:3, 0:3]
+            vel_vec_cam = R_Cam_from_Radar @ vel_vec_radar
+            # Extract Z component (Depth Velocity)
+            v_z_cam = vel_vec_cam[2]
+        else:
+            v_z_cam = 0.0
+
         # Call the solver with the inputs directly from our files
         full_vel_vector_radar = solve_full_velocity(
             up=up, vp=vp, uq=uq, vq=vq, d=depth_B, delta_t=world_delta_t,
             T_A_to_B=T_A_to_B, T_A_to_R=T_A_to_R,
-            speed_radial=speed_radial, point_radar_coords=point_radar_coords,
+            speed_radial=v_z_cam, point_radar_coords=point_radar_coords,
             return_in_radar_coords=True
         )
-        
         
         if full_vel_vector_radar is not None:
             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
@@ -175,7 +188,9 @@ def estimate_velocities_from_data(
                 camera=camera, 
                 xq_pix_f=xq_pix_f, 
                 yq_pix_f=yq_pix_f, 
-                delta_t=world_delta_t
+                delta_t=world_delta_t,
+                depth=depth_B,
+                noiseType=noiseType
             )
              
             if frame_displacement_error is not None:
@@ -189,13 +204,15 @@ def estimate_velocities_from_data(
                                           velocity_error_magnitude, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_radar)) # GT (World) for histogram
+                                          ground_truth_vel_radar,
+                                          object_id))
                 else:
                     frame_results.append((full_vel_magnitude, 
                                           0.0, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_radar)) # GT (World) for histogram
+                                          ground_truth_vel_radar,
+                                          object_id))
             
     return frame_results
 
@@ -204,13 +221,16 @@ def estimate_velocities_from_data(
 if __name__ == "__main__":
 
     # --- 1. Define Paths and Constants ---
-    CARLA_OUTPUT_DIR = "../carla/output2"
+    CARLA_OUTPUT_DIR = "../carla/output"
     DELTA_T = 0.05 # 20 FPS
     
     CAM_DIR = os.path.join(CARLA_OUTPUT_DIR, "camera_rgb")
     PLY_DIR = os.path.join(CARLA_OUTPUT_DIR, "radar_ply")
     POSES_DIR = os.path.join(CARLA_OUTPUT_DIR, "poses")
     CALIB_DIR = os.path.join(CARLA_OUTPUT_DIR, "calib")
+    # FLOW_DIR = os.path.join(CARLA_OUTPUT_DIR, "flow_cv")
+    FLOW_DIR = os.path.join(CARLA_OUTPUT_DIR, "flow")
+
 
     # --- 2. Load Static Calibration ---
     try:
@@ -224,7 +244,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # --- 3. Initialize Processors and Stats ---
-    optical_flow_calculator = OpticalFlow()
     print("\nStarting data processing loop...")
     
     all_real_velocity_abs_errors = []
@@ -240,13 +259,7 @@ if __name__ == "__main__":
         
     max_frames = len(all_image_files)
 
-    # "Prime" the optical flow calculator with the first frame (Frame 0)
-    try:
-        frame_0_rgb = cv2.cvtColor(cv2.imread(all_image_files[0]), cv2.COLOR_BGR2RGB)
-        optical_flow_calculator.inference(frame_0_rgb) # This just stores Frame 0
-    except Exception as e:
-        print(f"Error loading initial frame {all_image_files[0]}: {e}")
-        sys.exit(1)
+    tracker = ClusterTracker(hit_threshold=3, max_history=2)
 
     for frame_count in range(1, max_frames):
         
@@ -256,10 +269,14 @@ if __name__ == "__main__":
 
         pose_file_relative = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
         ply_file_B = os.path.join(PLY_DIR, f"{frame_id_B}.ply")
+
+        flow_file_B = os.path.join(FLOW_DIR, f"{frame_id_B}.npy")
         
         required_files = [
             image_path_B, 
-            pose_file_relative, ply_file_B
+            pose_file_relative, 
+            ply_file_B,
+            flow_file_B
         ]
 
         if not all(os.path.exists(f) for f in required_files):
@@ -275,12 +292,13 @@ if __name__ == "__main__":
             
             # Load detections from Frame B
             radar_detections: List[RadarDetection] = load_radar_ply(ply_file_B)
+
+            flow = np.load(flow_file_B)
             
         except Exception as e:
             print(f"Error loading data for frame {frame_id_B}: {e}. Skipping.")
             continue
 
-        flow = optical_flow_calculator.inference(current_frame_rgb)
         
         print(f"--- Frame {frame_count} ({frame_id_B}) ---")
         
@@ -303,8 +321,15 @@ if __name__ == "__main__":
             if current_frame_errors:
                 clusters, noise_points = cluster_detections_6d(
                     detections=current_frame_errors,
-                    eps=0.7, min_samples=4, velocity_weight=4.0   
+                    # need to optimize these
+                    eps=4.5, min_samples=3, velocity_weight=5.0   
                 )
+
+                # 2. Run Temporal Filtering
+                # This returns ONLY the clusters that are temporally consistent
+                # confirmed_clusters = tracker.update(clusters, DELTA_T)
+                
+                # print(f"Frame {frame_count}: Raw Clusters: {len(clusters)} -> Confirmed: {len(confirmed_clusters)}")
                 
                 gt_real, gt_random, gt_multipath = 0, 0, 0
                 tp_pd_vectors = []
@@ -348,104 +373,28 @@ if __name__ == "__main__":
 
                 all_tp.append(tp); all_fp.append(total_fp); all_fn.append(fn); all_tn.append(total_tn)
 
-                # Helper function for safe percentage error
-                def safe_percent_error(actual, predicted, average_gt):
-                    # Use a small epsilon to avoid division by zero if actual is tiny
-                    epsilon = 1e-5 
-                    if abs(actual) < epsilon:
-                        if abs(predicted) < epsilon:
-                            return 0.0 # Both are effectively zero
-                        else:
-                            return 100.0 # Actual is zero, predicted is not
-                    
-                    error = abs(actual - predicted)
-                    return (error / (abs(average_gt) + epsilon)) * 100.0
+                # save_cluster_survivor_analysis(frame_number=frame_count, clusters=clusters, output_dir="output/cluster_survivor_analysis")
+   
+                # save_clustering_analysis_plot(
+                #     frame_number=frame_count,
+                #     clusters=clusters,
+                #     noise_points=noise_points,
+                #     output_dir="output/clustering_analysis"
+                # )
 
-                if tp > 0:
-                    # Calculate mean vectors
-                    mean_pd_vec = np.mean(np.array(tp_pd_vectors), axis=0)
-                    mean_gt_vec = np.mean(np.array(tp_gt_vectors), axis=0)
-                    average_gt = float(np.linalg.norm(mean_gt_vec))
-                    
-                    # Calculate % error for each dimension
-                    err_x_pct = safe_percent_error(mean_gt_vec[0], mean_pd_vec[0], average_gt)
-                    err_y_pct = safe_percent_error(mean_gt_vec[1], mean_pd_vec[1], average_gt)
-                    err_z_pct = safe_percent_error(mean_gt_vec[2], mean_pd_vec[2], average_gt)
-                else:
-                    mean_pd_vec = np.array([0.0, 0.0, 0.0])
-                    mean_gt_vec = np.array([0.0, 0.0, 0.0])
-                    err_x_pct, err_y_pct, err_z_pct = 0.0, 0.0, 0.0
-                # --- END MODIFICATION ---
-
-                print(f"  Ground Truth: {total_real_points} Real | {total_noisy_points} Noisy (Random:{gt_random}, MP:{gt_multipath})")
-                print(f"  Algorithm Output: {len(clusters)} Clusters, {len(noise_points)} Noise Points")
-                print(f"  True Positives (TP):  {tp:4d} (Real points found)")
-                print(f"  False Negatives (FN): {fn:4d} (Real points missed)")
-                print(f"  False Positives (FP): {total_fp:4d} (Total noise clustered)")
-                print(f"    - FP Random:    {fp_random:4d} (Filtered {tn_random}/{gt_random})")
-                print(f"    - FP Multipath: {fp_multipath:4d} (Filtered {tn_multipath}/{gt_multipath})")
-                print(f"  Precision: {precision * 100:6.2f}% | Recall: {recall * 100:6.2f}% | F1-Score: {f1 * 100:6.2f}%")
-                print(f"  --- TP Velocity Analysis (Mean) ---")
-                print(f"    GT (X,Y,Z): ({mean_gt_vec[0]:6.2f}, {mean_gt_vec[1]:6.2f}, {mean_gt_vec[2]:6.2f})")
-                print(f"    PD (X,Y,Z): ({mean_pd_vec[0]:6.2f}, {mean_pd_vec[1]:6.2f}, {mean_pd_vec[2]:6.2f})")
-                print(f"    % Err (X,Y,Z): ({err_x_pct:6.1f}%, {err_y_pct:6.1f}%, {err_z_pct:6.1f}%)")
-                print(f"--------------------------------------")
-                
-                fp_dict = {'random': fp_random, 'mp': fp_multipath}
-                tn_dict = {'random': tn_random, 'mp': tn_multipath}
-                
-                save_clustering_analysis_plot(
-                    frame_number=frame_count,
-                    clusters=clusters,
-                    noise_points=noise_points,
-                    tp=tp, fp_dict=fp_dict, fn=fn, tn_dict=tn_dict,
-                    precision=precision, recall=recall, f1=f1,
-                    output_dir="output/clustering_analysis"
-                )
+            # save_frame_histogram_by_object(frame_count, current_frame_errors, current_frame_rgb, np.linalg.inv(T_A_to_R_static), K_cam, "output/object_analysis")
 
             if current_frame_errors:
-                real_velocity_errors, real_displacement_errors, noisy_displacement_errors = [], [], []
-                real_vel_magnitudes, noisy_vel_magnitudes = [], []
-                real_positions, real_velocities = [], []
-                noisy_positions, noisy_velocities = [], []
+                real_velocity_errors = []
+                real_vel_magnitudes = []
                 
-                for vel_mag, vel_err, disp_err, noiseType, pos_3d, vel_3d_radar, vel_3d_world_gt in current_frame_errors:
+                for vel_mag, vel_err, disp_err, noiseType, pos_3d, vel_3d_radar, vel_3d_world_gt, obj_id in current_frame_errors:
                     if(noiseType == NoiseType.REAL):
                         real_vel_magnitudes.append(vel_mag)
                         real_velocity_errors.append(vel_err)
-                        real_displacement_errors.append(disp_err)
-                        real_positions.append(pos_3d)
-                        real_velocities.append(vel_3d_radar)
-                    else:
-                        noisy_vel_magnitudes.append(vel_mag)
-                        noisy_displacement_errors.append(disp_err)
-                        noisy_positions.append(pos_3d)
-                        noisy_velocities.append(vel_3d_radar) # Use world for histogram
                 
                 all_real_velocity_abs_errors.extend(real_velocity_errors)
                 all_real_velocity_actual_magnitudes.extend(real_vel_magnitudes)
-
-                average_real_velocity_error = np.mean(real_velocity_errors) if real_velocity_errors else 0
-                average_real_displacement_error = np.mean(real_displacement_errors) if real_displacement_errors else 0
-                average_noisy_displacement_error = np.mean(noisy_displacement_errors) if noisy_displacement_errors else 0
-
-                save_frame_histogram(
-                        frame_number=frame_count,
-                        real_pred_vel_mags=real_vel_magnitudes,
-                        real_vel_errors=real_velocity_errors,
-                        real_disp_errors=real_displacement_errors,
-                        noisy_pred_vel_mags=noisy_vel_magnitudes,
-                        noisy_disp_errors=noisy_displacement_errors,
-                        real_positions=real_positions,
-                        real_velocities=real_velocities,
-                        noisy_positions=noisy_positions,
-                        noisy_velocities=noisy_velocities,
-                        output_dir="output/frame_analysis"
-                    )
-
-                print(f"Average Real Velocity Error: {average_real_velocity_error:.6f} m/s")
-                print(f"Average Real Displacement Error: {average_real_displacement_error:.6f} pix")
-                print(f"Average Noisy Displacement Error: {average_noisy_displacement_error:.6f} pix")
             
         else:
             print("  No radar detections loaded for this frame.")

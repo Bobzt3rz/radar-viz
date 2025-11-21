@@ -1,0 +1,3 @@
+python generate_flow.py ../carla/output/camera_rgb ../carla/output/flow
+
+python generate_flow.py ../carla/output/camera_rgb ../carla/output/flow_cv cv
