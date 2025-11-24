@@ -8,337 +8,279 @@ from .radar import Radar
 from .types import Vector3, Matrix3x3, Matrix4x4, FlowField, NoiseType, DetectionTuple
 
 def solve_full_velocity(
-    up: float, vp: float,                      # Normalized image coords at time t
-    uq: float, vq: float,                      # Normalized image coords at time t+delta_t
-    d: float,                                  # Depth of point P in camera coords at time t
-    delta_t: float,                            # Time interval
-    T_A_to_B: Matrix4x4,                       # Camera motion matrix (Pose B relative to A)
-    T_A_to_R: Matrix4x4,                       # Extrinsics: Camera A to Radar R
-    # --- New Radar Inputs ---
-    speed_radial: float,                       # Scalar radial speed (Doppler measurement)
-    point_radar_coords: Vector3,               # 3D position [x,y,z] of the point in RADAR coordinates
-    # --- Output Option ---
-    return_in_radar_coords: bool = True
+    up: float, vp: float,
+    uq: float, vq: float,
+    point_cam_B: Vector3,
+    delta_t: float,
+    T_A_to_B: Matrix4x4,   # Forward (Prev->Curr) for Matrices
+    T_B_to_A: Matrix4x4,   # Backward (Curr->Prev) for Depth
+    T_A_to_R: Matrix4x4,
+    speed_radial: float,
+    point_radar_coords: Vector3
 ) -> Optional[Vector3]:
     """
-    Solves for the 3D full velocity vector based on Eq 16a from the POW4R paper,
-    using scalar radial speed and point position as radar inputs.
-
-    Parameters:
-    ----------
-    up, vp : float
-        Normalized image plane coordinates of the point at time t (point 'p').
-    uq, vq : float
-        Normalized image plane coordinates of the point at time t+delta_t (point 'q').
-    d : float
-        Depth of the point P (in camera coordinates) at time t.
-    delta_t : float
-        Time interval between frames (in seconds).
-    T_A_to_B : Matrix4x4
-        4x4 transformation matrix for camera motion, from time t (A) to t+delta_t (B).
-    T_A_to_R : Matrix4x4
-        4x4 extrinsic transformation matrix from Camera (A) to Radar (R).
-    speed_radial : float
-        The scalar speed measured by the radar along the line of sight (Doppler speed).
-        Positive values typically mean moving away from the radar.
-    point_radar_coords : Vector3
-        The 3D coordinates [x, y, z] of the detected point in the RADAR's coordinate system.
-    return_in_radar_coords : bool, optional
-        If True (default), returns the final velocity in radar coordinates (v_f).
-        If False, returns the velocity in camera coordinates.
-
-    Returns:
-    -------
-    Optional[Vector3]
-        The 3D full-velocity vector (3-element array), or None if the
-        calculation fails (e.g., singular matrix, zero distance to point).
+    Corrected Solver.
+    t is defined in Frame A (Previous).
     """
+    # --- 1. Radar Constraint Setup ---
+    point_radar_coords = np.asarray(point_radar_coords, dtype=float)
+    dist = np.linalg.norm(point_radar_coords)
+    if dist < 1e-6: return None
+    u_vec_rad = point_radar_coords / dist
+    
+    # Rotate Radar Unit Vec to Camera Frame
+    R_cam_to_rad = T_A_to_R[0:3, 0:3]
+    R_rad_to_cam = R_cam_to_rad.T
+    r_vec_cam = R_rad_to_cam @ u_vec_rad
 
-    # --- 1. Calculate the 3D Radial Velocity Vector (v_r) ---
-    # Ensure point coords is a numpy array
-    point_radar_coords = np.asarray(point_radar_coords, dtype=np.floating)
+    # --- 2. Matrix Coefficients (From Forward Transform A->B) ---
+    alpha = T_A_to_B[0:3, 0:3]
+    beta  = T_A_to_B[0:3, 3]
 
-    # Calculate distance to the point
-    distance = np.linalg.norm(point_radar_coords)
-    if distance < 1e-6: # Avoid division by zero
-        print("Warning: Radar point is too close to the origin, cannot determine direction.")
+    # --- 3. Depth & Gradient Calculation ---
+    # We need d(t-1). We assume t is defined in Frame A.
+    # P_prev = T_B_to_A @ P_curr - t  (Wait. P_curr = T_AB @ (P_prev + t). Correct.)
+    # d = P_prev.z
+    # P_virtual_prev = T_B_to_A @ P_curr
+    # d = P_virtual_prev.z - t_z
+    
+    point_cam_B_h = np.append(point_cam_B, 1.0)
+    p_virtual_prev = (T_B_to_A @ point_cam_B_h)[:3]
+    
+    d_static = p_virtual_prev[2]
+    k_vec = np.array([0.0, 0.0, -1.0]) # Gradient of d w.r.t t=[tx,ty,tz]
+
+    # --- 4. Build LHS Matrix M ---
+    M = np.zeros((3, 3), dtype=float)
+    # Camera Rows (using alpha from A->B)
+    for j in range(3):
+        M[0, j] = alpha[0, j] - uq * alpha[2, j]
+        M[1, j] = alpha[1, j] - vq * alpha[2, j]
+    # Radar Row
+    M[2, :] = r_vec_cam
+
+    # --- 5. Build C Vector (Depth Multiplier) ---
+    p_uv_hom_prev = np.array([up, vp, 1.0])
+    comm = np.dot(alpha[2, :], p_uv_hom_prev)
+    
+    C = np.zeros(3)
+    C[0] = uq * comm - np.dot(alpha[0, :], p_uv_hom_prev)
+    C[1] = vq * comm - np.dot(alpha[1, :], p_uv_hom_prev)
+    C[2] = 0.0
+
+    # --- 6. Apply Correction (M - C outer k) ---
+    correction = np.outer(C, k_vec)
+    M_corrected = M - correction
+
+    # --- 7. Build RHS ---
+    B = np.zeros(3, dtype=float)
+    offset_1 = uq * beta[2] - beta[0]
+    offset_2 = vq * beta[2] - beta[1]
+    offset_3 = speed_radial * delta_t
+    
+    B[0] = C[0] * d_static + offset_1
+    B[1] = C[1] * d_static + offset_2
+    B[2] = C[2] * d_static + offset_3
+
+    # --- 8. Solve ---
+    try:
+        t_vec = np.linalg.solve(M_corrected, B)
+    except np.linalg.LinAlgError:
         return None
 
-    # Calculate the unit direction vector from radar origin to the point
-    unit_direction_vector: Vector3 = point_radar_coords / distance
+    velocity_cam = t_vec / delta_t
+    return R_cam_to_rad @ velocity_cam
 
-    # --- 2. Extract matrix components ---
-    a11, a12, a13, bx = T_A_to_B[0, :]
-    a21, a22, a23, by = T_A_to_B[1, :]
-    a31, a32, a33, bz = T_A_to_B[2, :]
-    R_cam_to_radar: Matrix3x3 = T_A_to_R[0:3, 0:3]
+# # --- Helper Function for Velocity Estimation ---
+# def estimate_velocities_for_frame(
+#     radar_detections: List[Tuple[Vector3, float, Optional[Entity], NoiseType]],
+#     flow: Optional[FlowField],
+#     camera: Camera,
+#     radar: Radar,
+#     prev_poses: Dict[str, Any],
+#     world_delta_t: float
+# ) -> List[DetectionTuple]:
+#     """
+#     Calculates full velocity for radar detections using data from two time steps.
+#     Returns a list of tuples:
+#     (vel_mag, vel_err, disp_err, NoiseType, pos_3d_radar, vel_3d_radar, vel_3d_world)
+#     """
+#     frame_results: List[DetectionTuple] = []
 
-    # --- 3. Build the 3x3 matrix M (Eq 16a) ---
-    M: Matrix3x3 = np.zeros((3, 3), dtype=np.floating)
-    M[0, 0] = a11 - uq * a31
-    M[0, 1] = a12 - uq * a32
-    M[0, 2] = a13 - uq * a33
-    M[1, 0] = a21 - vq * a31
-    M[1, 1] = a22 - vq * a32
-    M[1, 2] = a23 - vq * a33
-    M[2, :] = R_cam_to_radar.T @ unit_direction_vector
+#     # Check if we have necessary data
+#     if flow is None or not prev_poses or 'camera' not in prev_poses:
+#         # print("  Waiting for prev state/flow...") # Optional debug
+#         return frame_results # Return empty list if prerequisites not met
 
-    # --- 4. Build the 3x1 vector B (Eq 16a) ---
-    B: Vector3 = np.zeros(3, dtype=np.floating)
-    term1_d: float = (a31*up + a32*vp + a33) * uq
-    term2_d: float = -(a11*up + a12*vp + a13)
-    B[0] = (term1_d + term2_d) * d + (uq * bz - bx)
-    term3_d: float = (a31*up + a32*vp + a33) * vq
-    term4_d: float = -(a21*up + a22*vp + a23)
-    B[1] = (term3_d + term4_d) * d + (vq * bz - by)
+#     # 1. Get current & previous poses
+#     try:
+#         current_cam_pose_W2L = camera.get_pose_world_to_local()
+#         prev_cam_pose_W2L = prev_poses['camera']
+#         prev_radar_pose_W2L = prev_poses['radar']
 
-    B[2] = speed_radial * delta_t
+#         # Check if matrices are invertible before proceeding
+#         inv_prev_cam_pose_W2L = np.linalg.inv(prev_cam_pose_W2L)
+#         inv_prev_radar_pose_W2L = np.linalg.inv(prev_radar_pose_W2L)
 
-    # --- 5. Solve the linear system M * t_vec = B ---
-    try:
-        t_vec: Vector3 = np.linalg.solve(M, B)
-    except np.linalg.LinAlgError:
-        print("Warning: The matrix M is singular, cannot solve for velocity.")
-        return None
+#     except (KeyError, np.linalg.LinAlgError, TypeError):
+#         print("  Error accessing or inverting previous poses.")
+#         return frame_results # Return empty if poses are missing/invalid
 
-    # --- 6. Convert motion vector to velocity ---
-    velocity_camera_coords: Vector3 = t_vec / delta_t
+#     # 2. Calculate relative transformations (given these from ego velocity estimation + calibration)
+#     T_A_to_B = current_cam_pose_W2L @ inv_prev_cam_pose_W2L
+#     T_A_to_R = prev_radar_pose_W2L @ inv_prev_cam_pose_W2L
 
-    if not return_in_radar_coords:
-        return velocity_camera_coords
+#     # This is T_Cam(A)_from_Radar(A), which is static and valid for all time.
+#     try:
+#         T_Cam_from_Radar_static = np.linalg.inv(T_A_to_R)
+#     except np.linalg.LinAlgError:
+#         print("  Error inverting T_A_to_R to find static extrinsic.")
+#         return frame_results
 
-    # Convert to RADAR coordinates to get v_f (Eq 13)
-    velocity_radar_coords: Vector3 = R_cam_to_radar @ velocity_camera_coords
+#     # --- SIMULATION-ONLY ---
+#     # This part is ONLY for comparing against world-frame ground truth.
+#     # A real system would not have this.
+#     R_A_radar_to_world = inv_prev_radar_pose_W2L[0:3, 0:3]
+#     # --- END SIMULATION-ONLY ---
 
-    return velocity_radar_coords
+#     # 3. Process each detection
+#     for detection_idx, detection in enumerate(radar_detections):
+#         point_radar_coords, speed_radial, source_entity, noiseType = detection
 
-# --- Helper Function for Velocity Estimation ---
-def estimate_velocities_for_frame(
-    radar_detections: List[Tuple[Vector3, float, Optional[Entity], NoiseType]],
-    flow: Optional[FlowField],
-    camera: Camera,
-    radar: Radar,
-    prev_poses: Dict[str, Any],
-    world_delta_t: float
-) -> List[DetectionTuple]:
-    """
-    Calculates full velocity for radar detections using data from two time steps.
-    Returns a list of tuples:
-    (vel_mag, vel_err, disp_err, NoiseType, pos_3d_radar, vel_3d_radar, vel_3d_world)
-    """
-    frame_results: List[DetectionTuple] = []
+#         # --- Calculate (xq_pix, yq_pix) and (uq, vq) at t+delta_t ---
+#         # Convert radar point (t+delta_t) to world (t+delta_t)
+#         point_rad_h = np.append(point_radar_coords, 1.0)
+#         # print(f"point_rad_h: {point_rad_h}")
 
-    # Check if we have necessary data
-    if flow is None or not prev_poses or 'camera' not in prev_poses:
-        # print("  Waiting for prev state/flow...") # Optional debug
-        return frame_results # Return empty list if prerequisites not met
+#         # Convert radar (B) directly to camera (B) using the static extrinsic
+#         point_cam_B_h = T_Cam_from_Radar_static @ point_rad_h
+#         # print(f"point_cam_B_h: {point_cam_B_h}")
+#         point_cam_B = point_cam_B_h[:3]
+#         depth_B = point_cam_B[2]
+#         # print(f"depth_B: {depth_B}")
 
-    # 1. Get current & previous poses
-    try:
-        current_cam_pose_W2L = camera.get_pose_world_to_local()
-        prev_cam_pose_W2L = prev_poses['camera']
-        prev_radar_pose_W2L = prev_poses['radar']
+#         if depth_B <= 1e-3: continue # Point is behind or too close to camera B
 
-        # Check if matrices are invertible before proceeding
-        inv_prev_cam_pose_W2L = np.linalg.inv(prev_cam_pose_W2L)
-        inv_prev_radar_pose_W2L = np.linalg.inv(prev_radar_pose_W2L)
+#         # Normalized coords (t+delta_t)
+#         uq = point_cam_B[0] / depth_B
+#         vq = point_cam_B[1] / depth_B
+#         # print(f"uq: {uq}, vq: {vq}")
 
-    except (KeyError, np.linalg.LinAlgError, TypeError):
-        print("  Error accessing or inverting previous poses.")
-        return frame_results # Return empty if poses are missing/invalid
+#         # Pixel coords (t+delta_t) - careful with int conversion if needed early
+#         xq_pix_f = camera.fx * uq + camera.cx
+#         yq_pix_f = camera.fy * vq + camera.cy
+#         xq_pix = int(round(xq_pix_f))
+#         yq_pix = int(round(yq_pix_f))
+#         # print(f"xq_pix: {xq_pix}, yq_pix: {yq_pix}")
 
-    # 2. Calculate relative transformations (given these from ego velocity estimation + calibration)
-    T_A_to_B = current_cam_pose_W2L @ inv_prev_cam_pose_W2L
-    T_A_to_R = prev_radar_pose_W2L @ inv_prev_cam_pose_W2L
+#         # Check image bounds
+#         if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
+#             continue
 
-    # This is T_Cam(A)_from_Radar(A), which is static and valid for all time.
-    try:
-        T_Cam_from_Radar_static = np.linalg.inv(T_A_to_R)
-    except np.linalg.LinAlgError:
-        print("  Error inverting T_A_to_R to find static extrinsic.")
-        return frame_results
+#         # --- Get flow and calculate (up, vp) at t ---
+#         dx, dy = flow[yq_pix, xq_pix] # Pixel flow
+#         # print(f"dx: {dx}, dy: {dy}")
+#         xp_pix_f = xq_pix_f - dx
+#         yp_pix_f = yq_pix_f - dy
+#         # print(f"xp_pix_f: {xp_pix_f}, yp_pix_f: {yp_pix_f}")
 
-    # --- SIMULATION-ONLY ---
-    # This part is ONLY for comparing against world-frame ground truth.
-    # A real system would not have this.
-    R_A_radar_to_world = inv_prev_radar_pose_W2L[0:3, 0:3]
-    # --- END SIMULATION-ONLY ---
+#         # Normalized coords (t)
+#         up = (xp_pix_f - camera.cx) / camera.fx
+#         vp = (yp_pix_f - camera.cy) / camera.fy
+#         # print(f"up: {up}, vp: {vp}")
 
-    # 3. Process each detection
-    for detection_idx, detection in enumerate(radar_detections):
-        point_radar_coords, speed_radial, source_entity, noiseType = detection
-
-        # --- Calculate (xq_pix, yq_pix) and (uq, vq) at t+delta_t ---
-        # Convert radar point (t+delta_t) to world (t+delta_t)
-        point_rad_h = np.append(point_radar_coords, 1.0)
-        # print(f"point_rad_h: {point_rad_h}")
-
-        # Convert radar (B) directly to camera (B) using the static extrinsic
-        point_cam_B_h = T_Cam_from_Radar_static @ point_rad_h
-        # print(f"point_cam_B_h: {point_cam_B_h}")
-        point_cam_B = point_cam_B_h[:3]
-        depth_B = point_cam_B[2]
-        # print(f"depth_B: {depth_B}")
-
-        if depth_B <= 1e-3: continue # Point is behind or too close to camera B
-
-        # Normalized coords (t+delta_t)
-        uq = point_cam_B[0] / depth_B
-        vq = point_cam_B[1] / depth_B
-        # print(f"uq: {uq}, vq: {vq}")
-
-        # Pixel coords (t+delta_t) - careful with int conversion if needed early
-        xq_pix_f = camera.fx * uq + camera.cx
-        yq_pix_f = camera.fy * vq + camera.cy
-        xq_pix = int(round(xq_pix_f))
-        yq_pix = int(round(yq_pix_f))
-        # print(f"xq_pix: {xq_pix}, yq_pix: {yq_pix}")
-
-        # Check image bounds
-        if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
-            continue
-
-        # --- Get flow and calculate (up, vp) at t ---
-        dx, dy = flow[yq_pix, xq_pix] # Pixel flow
-        # print(f"dx: {dx}, dy: {dy}")
-        xp_pix_f = xq_pix_f - dx
-        yp_pix_f = yq_pix_f - dy
-        # print(f"xp_pix_f: {xp_pix_f}, yp_pix_f: {yp_pix_f}")
-
-        # Normalized coords (t)
-        up = (xp_pix_f - camera.cx) / camera.fx
-        vp = (yp_pix_f - camera.cy) / camera.fy
-        # print(f"up: {up}, vp: {vp}")
-
-        # --- Call the solver ---
-        full_vel_vector_radar = solve_full_velocity(
-            up=up, vp=vp, uq=uq, vq=vq, d=depth_B, delta_t=world_delta_t,
-            T_A_to_B=T_A_to_B, T_A_to_R=T_A_to_R,
-            speed_radial=speed_radial, point_radar_coords=point_radar_coords,
-            return_in_radar_coords=True
-        )
+#         # --- Call the solver ---
+#         full_vel_vector_radar = solve_full_velocity(
+#             up=up, vp=vp, uq=uq, vq=vq, d=depth_B, delta_t=world_delta_t,
+#             T_A_to_B=T_A_to_B, T_A_to_R=T_A_to_R,
+#             speed_radial=speed_radial, point_radar_coords=point_radar_coords,
+#             return_in_radar_coords=True
+#         )
 
         
-        if full_vel_vector_radar is not None:
-            full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
-            full_vel_world = R_A_radar_to_world @ full_vel_vector_radar
+#         if full_vel_vector_radar is not None:
+#             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
+#             full_vel_world = R_A_radar_to_world @ full_vel_vector_radar
             
-            frame_displacement_error = calculate_reprojection_error(
-                full_vel_radar_A=full_vel_vector_radar,
-                point_radar_B=point_radar_coords,
-                T_Cam_from_Radar=T_Cam_from_Radar_static,
-                T_CamB_from_CamA=T_A_to_B,
-                flow=flow, 
-                camera=camera, 
-                xq_pix_f=xq_pix_f, 
-                yq_pix_f=yq_pix_f, 
-                delta_t=world_delta_t
-            )
+#             frame_displacement_error = calculate_reprojection_error(
+#                 full_vel_radar_A=full_vel_vector_radar,
+#                 point_radar_B=point_radar_coords,
+#                 T_Cam_from_Radar=T_Cam_from_Radar_static,
+#                 T_CamB_from_CamA=T_A_to_B,
+#                 flow=flow, 
+#                 camera=camera, 
+#                 xq_pix_f=xq_pix_f, 
+#                 yq_pix_f=yq_pix_f, 
+#                 delta_t=world_delta_t
+#             )
              
-            if frame_displacement_error is not None and source_entity is not None:
-                ground_truth_vel = source_entity.velocity
-                velocity_error_magnitude = float(np.linalg.norm(full_vel_world - ground_truth_vel))
-                frame_results.append((full_vel_magnitude, 
-                                      velocity_error_magnitude, frame_displacement_error, 
-                                      noiseType, point_radar_coords, full_vel_vector_radar, full_vel_world))
-                continue
+#             if frame_displacement_error is not None and source_entity is not None:
+#                 ground_truth_vel = source_entity.velocity
+#                 velocity_error_magnitude = float(np.linalg.norm(full_vel_world - ground_truth_vel))
+#                 frame_results.append((full_vel_magnitude, 
+#                                       velocity_error_magnitude, frame_displacement_error, 
+#                                       noiseType, point_radar_coords, full_vel_vector_radar, full_vel_world))
+#                 continue
             
-            if(frame_displacement_error is not None and noiseType is not NoiseType.REAL):
-                frame_results.append((full_vel_magnitude, 
-                                      0.0, frame_displacement_error, 
-                                      noiseType, point_radar_coords, full_vel_vector_radar, full_vel_world))
-    return frame_results
+#             if(frame_displacement_error is not None and noiseType is not NoiseType.REAL):
+#                 frame_results.append((full_vel_magnitude, 
+#                                       0.0, frame_displacement_error, 
+#                                       noiseType, point_radar_coords, full_vel_vector_radar, full_vel_world))
+#     return frame_results
 
 def calculate_reprojection_error(
-    full_vel_radar_A: Vector3,            # Velocity expressed in Radar(A) frame
-    point_radar_B: Vector3,               # Point position in Radar(B) frame
-    T_Cam_from_Radar: Matrix4x4,          # Static Extrinsic: T_Cam(A)_from_Radar(A)
-    T_CamB_from_CamA: Matrix4x4,          # Relative Motion: T_Cam(B)_from_Cam(A)
-    flow: FlowField,                      # Flow field
-    camera: Camera,                       # Camera object for intrinsics
-    xq_pix_f: float, yq_pix_f: float,     # Projected 3D radar point to image frame at t (B)
-    delta_t: float,                        # Simulation time step
-    depth: float,
-    noiseType: NoiseType
+    full_vel_radar: Vector3,
+    point_radar_B: Vector3,
+    T_Cam_from_Radar: Matrix4x4,
+    T_B_to_A: Matrix4x4, # Explicit back-transform
+    flow: FlowField,
+    camera: Camera,
+    xq_pix_f: float, yq_pix_f: float,
+    delta_t: float
 ) -> Optional[float]:
-    """
-    Calculates the reprojection error using only relative transformations.
-    The "world" frame for this calculation is defined as the Camera(A) frame.
-    """
     
-    # --- 1. Define all state in our "World" frame (Camera A) ---
-    
-    # 1a. Get predicted velocity in the Cam(A) frame.
-    # We must use the 3x3 rotation part of the static extrinsic.
+    # 1. Get Velocity in Camera Frame
+    # Note: Solver returns velocity in RADAR frame
+    # We need velocity in CAMERA frame
     R_Cam_from_Radar = T_Cam_from_Radar[0:3, 0:3]
-    vel_cam_A_predicted = R_Cam_from_Radar @ full_vel_radar_A
+    vel_cam = R_Cam_from_Radar @ full_vel_radar
 
-    # 1b. Get the point's position at time B, expressed in the Cam(A) frame.
-    # This is the most complex step. Path: Radar(B) -> Cam(B) -> Cam(A)
+    # 2. Get Point B in Camera Frame
     point_radar_B_h = np.append(point_radar_B, 1.0)
+    point_cam_B = (T_Cam_from_Radar @ point_radar_B_h)[:3]
+
+    # 3. Predict Point A
+    # The solver assumed t (motion) is in Frame A.
+    # P_curr = T_AB @ (P_prev + t)
+    # P_prev = T_BA @ P_curr - t
+    # P_prev = T_BA @ P_curr - (vel_cam * dt)
+    # CAUTION: Is vel_cam defined in Frame A or B?
+    # Eq 13: R * t = ... t is motion in Frame A (as defined by P+M->Q)
+    # So vel_cam is in Frame A.
     
-    # T_Cam(A)_from_Radar(B) = T_Cam(A)_from_Cam(B) @ T_Cam(B)_from_Radar(B)
-    T_CamA_from_CamB = np.linalg.inv(T_CamB_from_CamA)
-    # The static extrinsic is the same at time B
-    T_CamB_from_RadarB = T_Cam_from_Radar 
+    point_cam_B_h = np.append(point_cam_B, 1.0)
+    p_virtual_prev = (T_B_to_A @ point_cam_B_h)[:3]
     
-    T_CamA_from_RadarB = T_CamA_from_CamB @ T_CamB_from_RadarB
-    point_cam_A_at_B_h = T_CamA_from_RadarB @ point_radar_B_h
+    point_cam_A_pred = p_virtual_prev - (vel_cam * delta_t)
 
-    # We now have P(B) and V(A), both expressed in the Cam(A) frame.
-    point_cam_A_at_B = point_cam_A_at_B_h[:3] # This is P(B) in Cam(A) frame
+    # 4. Project
+    if point_cam_A_pred[2] <= 1e-3: return None
     
-    # --- 2. Predict the point's 3D position at time A ---
+    u = point_cam_A_pred[0] / point_cam_A_pred[2]
+    v = point_cam_A_pred[1] / point_cam_A_pred[2]
     
-    # P(A) = P(B) - V * dt
-    # All terms are now in the same frame (Cam_A), so this physics is valid.
-    point_cam_A_predicted = point_cam_A_at_B - vel_cam_A_predicted * delta_t
+    pred_x = camera.fx * u + camera.cx
+    pred_y = camera.fy * v + camera.cy
     
-    # --- 3. Project predicted 3D point (A) into pixel (A) ---
+    # 5. Compare with Flow (Forward: prev -> curr)
+    # The flow vector at (prev) points to (curr).
+    # We are at (curr). We have dx, dy which maps prev -> curr.
+    # So x_prev = x_curr - dx
+    dx, dy = flow[int(round(yq_pix_f)), int(round(xq_pix_f))]
+    actual_x = xq_pix_f - dx
+    actual_y = yq_pix_f - dy
     
-    try:
-        # The point is already in the Cam(A) frame, so we just project it.
-        previous_depth_A_predicted = point_cam_A_predicted[2]
-        if previous_depth_A_predicted <= 1e-3:
-            return None
-
-        # Normalized coords
-        previous_up_predicted = point_cam_A_predicted[0] / previous_depth_A_predicted
-        previous_vp_predicted = point_cam_A_predicted[1] / previous_depth_A_predicted 
-
-        # Pixel coords
-        previous_xp_pred_pix_f = camera.fx * previous_up_predicted + camera.cx
-        previous_yp_pred_pix_f = camera.fy * previous_vp_predicted + camera.cy
-        
-    except Exception as e:
-        # print(f" Reprojection math error: {e}") # Debug
-        return None
-
-    # --- 4. Get "Observed" pixel position (A) from flow ---
-    xq_pix = int(round(xq_pix_f))
-    yq_pix = int(round(yq_pix_f))
-
-    dx, dy = flow[yq_pix, xq_pix] # Pixel flow
-    flow_previous_xp_pred_pix_f = xq_pix_f - dx
-    flow_previous_yp_pred_pix_f = yq_pix_f - dy
-
-    # --- 5. Calculate Euclidean distance error in pixels ---
-    error_x = previous_xp_pred_pix_f - flow_previous_xp_pred_pix_f
-    error_y = previous_yp_pred_pix_f - flow_previous_yp_pred_pix_f
-
-    absolute_reprojection_error = math.sqrt(error_x**2 + error_y**2)
-
-    # --- 6. NORMALIZE ---
-    # Calculate magnitude of the actual flow vector
-    flow_magnitude = math.sqrt(dx**2 + dy**2)
-    
-    # Use max(1.0, ...) to avoid division by zero for stationary objects.
-    # If flow is < 1 pixel, we treat the absolute error as the relative error.
-    normalized_error = absolute_reprojection_error / max(1.0, flow_magnitude)
-
-    angle_error = calculate_corrected_angle_error(full_vel_radar_A, point_radar_B, T_Cam_from_Radar, T_CamB_from_CamA, dx, dy, camera, delta_t)
-
-    return absolute_reprojection_error
+    return math.sqrt((pred_x - actual_x)**2 + (pred_y - actual_y)**2)
 
 def calculate_corrected_angle_error(
     full_vel_radar_A: Vector3,            

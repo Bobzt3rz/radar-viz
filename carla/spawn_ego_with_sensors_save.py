@@ -186,6 +186,10 @@ def radar_to_camera_projection(
                         # print(f"--- WARNING: VELOCITY CHECK FAILED (Carla's GT) ---")
                         # print(f"  Frame: {radar_data.frame}")
 
+                # add random noise 80% of the time
+                if random.random() > 0.8:
+                    continue
+
                 projected_points.append(
                     RadarPoint(
                         pixel_uv=(pixel_u, pixel_v),
@@ -299,6 +303,127 @@ def generate_multipath_points(
                 pass
                 
     return ghost_points
+
+def generate_actor_scattering_points(
+    real_points: List[RadarPoint],
+    world: carla.World,
+    camera: carla.Actor,
+    camera_intrinsics: NDArray[np.float32],
+    scattering_ratio: float = 0.8, # <--- CHANGED: Multiplier for real points
+    scatter_margin: float = 1,   # Meters around the object to scatter points
+    velocity_noise: float = 0.5    # m/s
+) -> List[RadarPoint]:
+    """
+    Generates random radar points surrounding the bounding box of detected actors.
+    The number of points generated is (count_real_points * scattering_ratio).
+    """
+    scattering_points: List[RadarPoint] = []
+    
+    # --- 1. Aggregate Radial Velocities per Actor ---
+    # Map: actor_id -> list of radial velocities from real points
+    actor_velocities: Dict[int, List[float]] = {}
+    detected_actor_ids = set()
+
+    for p in real_points:
+        if p.object_type == ObjectType.ACTOR and p.actor_id != 0:
+            if p.actor_id not in actor_velocities:
+                actor_velocities[p.actor_id] = []
+            actor_velocities[p.actor_id].append(p.radial_velocity)
+            detected_actor_ids.add(p.actor_id)
+
+    # --- Pre-calculate Camera Matrix ---
+    T_world_camera: carla.Transform = camera.get_transform()
+    T_camera_world_matrix_np = np.array(T_world_camera.get_inverse_matrix())
+    K = camera_intrinsics
+    img_height, img_width = K[1, 2] * 2, K[0, 2] * 2
+
+    # --- 2. Iterate through detected actors ---
+    for actor_id in detected_actor_ids:
+        actor = world.get_actor(actor_id)
+        if not actor:
+            continue
+            
+        vels = actor_velocities[actor_id]
+        if not vels: continue
+        
+        # --- NEW LOGIC: Calculate Count based on Ratio ---
+        num_real_points = len(vels)
+        points_to_generate = int(num_real_points * scattering_ratio)
+        
+        if points_to_generate == 0:
+            continue
+
+        avg_radial_vel = sum(vels) / len(vels)
+
+        # Get Geometry
+        bbox: carla.BoundingBox = actor.bounding_box
+        transform: carla.Transform = actor.get_transform()
+        
+        # Box extents (half-sizes)
+        bx, by, bz = bbox.extent.x, bbox.extent.y, bbox.extent.z
+        loc_center = bbox.location 
+
+        for _ in range(points_to_generate):
+            # --- 3. Generate Random Point in "Outer Perimeter" ---
+            # Random sign (+1 or -1)
+            sx = 1 if random.random() < 0.5 else -1
+            sy = 1 if random.random() < 0.5 else -1
+            sz = 1 if random.random() < 0.5 else -1
+            
+            # Generate offsets strictly OUTSIDE the extent, but within margin
+            rx = (bx + random.uniform(0, scatter_margin)) * sx
+            ry = (by + random.uniform(0, scatter_margin)) * sy
+            rz = (bz + random.uniform(0, scatter_margin)) * sz
+            
+            p_local_actor = carla.Location(
+                x = loc_center.x + rx,
+                y = loc_center.y + ry,
+                z = loc_center.z + rz
+            )
+            
+            p_world = transform.transform(p_local_actor)
+            
+            # --- 4. Project to Camera ---
+            p_world_h = np.array([p_world.x, p_world.y, p_world.z, 1.0])
+            p_cam_local = T_camera_world_matrix_np @ p_world_h
+            
+            if p_cam_local[0] <= 0: continue # Behind camera
+
+            x_cam, y_cam, z_cam = p_cam_local[0], p_cam_local[1], p_cam_local[2]
+            
+            u_norm = y_cam / x_cam
+            v_norm = -z_cam / x_cam
+            pixel_u = K[0, 0] * u_norm + K[0, 2]
+            pixel_v = K[1, 1] * v_norm + K[1, 2]
+
+            if (0 <= pixel_u < img_width) and (0 <= pixel_v < img_height):
+                
+                final_vel = avg_radial_vel + random.gauss(0, velocity_noise)
+                
+                # Approximate range/angles based on camera-local coords 
+                # (Assuming co-located sensors)
+                r_dist = np.linalg.norm([x_cam, y_cam, z_cam])
+                
+                scattering_points.append(
+                    RadarPoint(
+                        pixel_uv=(pixel_u, pixel_v),
+                        local_x=x_cam, 
+                        local_y=y_cam,
+                        local_z=z_cam,
+                        azimuth=np.arctan2(y_cam, x_cam),
+                        elevation=np.arcsin(z_cam / r_dist),
+                        range=r_dist,
+                        radial_velocity=final_vel,
+                        vx_gt=0.0, vy_gt=0.0, vz_gt=0.0,
+                        vx_gt_world=0.0, vy_gt_world=0.0, vz_gt_world=0.0,
+                        world_location=p_world,
+                        noise_type=NoiseType.MULTIPATH,
+                        object_type=ObjectType.ACTOR,
+                        actor_id=actor_id
+                    )
+                )
+
+    return scattering_points
 
 def generate_static_clutter(
     camera: carla.Actor, # This is the co-located instance_camera
@@ -687,7 +812,7 @@ def main() -> None:
         radar_bp: carla.ActorBlueprint = blueprint_library.find('sensor.other.radar')
         radar_fov_horiz: float = 70.0
         radar_fov_vert: float = 40.0
-        radar_range: float = 100.0
+        radar_range: float = 70.0
         radar_bp.set_attribute('points_per_second', '15000')
         radar_bp.set_attribute('horizontal_fov', str(radar_fov_horiz))
         radar_bp.set_attribute('vertical_fov', str(radar_fov_vert))
@@ -834,14 +959,23 @@ def main() -> None:
                 )
                 # --- END MODIFIED CALL ---
                 
-                ghost_points: List[RadarPoint] = generate_multipath_points(
+                # ghost_points: List[RadarPoint] = generate_multipath_points(
+                #     real_points,
+                #     world,
+                #     instance_camera,
+                #     K_instance,
+                #     ego_vehicle_velocity
+                # )
+
+                ghost_points = generate_actor_scattering_points(
                     real_points,
                     world,
                     instance_camera,
                     K_instance,
-                    ego_vehicle_velocity
+                    scattering_ratio=0.7, # <--- If 10 real points, generates 8 ghosts
+                    scatter_margin=0.5,   # Meters outside the bounding box
+                    velocity_noise=0.5
                 )
-                
                 
                 random_clutter_points: List[RadarPoint] = generate_static_clutter(
                     instance_camera,
@@ -854,6 +988,8 @@ def main() -> None:
                     points_to_generate=500, # Adjust this number as needed
                     velocity_std_dev=0.3 # Adjust this number as needed
                 )
+
+                
                 
                 all_points = real_points + ghost_points + random_clutter_points
                 

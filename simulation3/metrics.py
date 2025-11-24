@@ -28,6 +28,8 @@ def calculate_reprojection_error(
     
     # 2. Project to 2D
     uv_projected, _ = project_point(K, P_prev_estimated)
+
+    print(f"previous uv: {obs_cam_prev.flatten()}, projected uv: {uv_projected}")
     
     if uv_projected is None:
         # If the estimated velocity pushes the point behind the camera, return high error

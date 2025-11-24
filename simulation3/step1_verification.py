@@ -32,7 +32,6 @@ def run_flaw_analysis() -> None:
     rig_pose_prev = Transform.identity()
     obs_cam_prev = cam.observe(point, rig_pose_prev)
     if obs_cam_prev is None: return
-    gt_depth_prev = float(point.position_w[2])
 
     # --- t ---
     rig_pose_curr = rig_pose_prev
@@ -49,13 +48,6 @@ def run_flaw_analysis() -> None:
     # FIX: Use T_cam_radar directly because it is defined as P_rad -> P_cam
     # P_c_curr = T_cam_radar @ P_rad
     P_c_curr = (T_cam_radar.to_matrix() @ np.append(P_r_curr, [[1]], axis=0))[:3]
-    
-    # P_prev_est = T_ego @ P_c_curr
-    P_prev_est = (T_c_prev_c_curr.to_matrix() @ np.append(P_c_curr, [[1]], axis=0))[:3]
-    honest_depth_est = float(P_prev_est[2])
-    
-    print(f"GT Depth (t-1):     {gt_depth_prev:.4f} m")
-    print(f"Est Depth (Honest): {honest_depth_est:.4f} m")
     
     # --- Run Solver ---
     v_est = solve_pow4r_velocity_corrected(

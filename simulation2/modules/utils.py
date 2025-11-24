@@ -587,14 +587,22 @@ def project_and_get_depths(
 def save_frame_histogram_by_object(
     frame_number: int,
     all_frame_detections: List[DetectionTuple],
-    image_rgb: np.ndarray,                   
-    T_Cam_from_Radar: np.ndarray,      # Extrinsics (T_C_R)
-    K: np.ndarray,                     # Intrinsics (K)
+    image_rgb: np.ndarray,                    
+    T_Cam_from_Radar: np.ndarray,       # Extrinsics (T_C_R)
+    K: np.ndarray,                      # Intrinsics (K)
     output_dir: str = "output/object_analysis"
 ):
     """
-    Groups detections, calculates metrics, and saves a 2x3 statistical analysis plot
-    and an image projection plot per object.
+    Groups detections, calculates metrics, and saves a 3x3 statistical analysis plot.
+    
+    Logic Update:
+    - Object ID 0: Plots 'Real' vs 'Random Noise' (Purple).
+    - Other IDs:   Plots 'Real' vs 'Multipath' (Red).
+    
+    Grid Layout:
+    [Vx]   [Vy]   [Vz]
+    [Vxy]  [Vyz]  [Vxz]
+    [Vxyz] [Pos3D][Vel3D]
     """
     
     # 1. Group all detections by object_id
@@ -605,236 +613,188 @@ def save_frame_histogram_by_object(
             grouped_detections[object_id] = []
         grouped_detections[object_id].append(det)
 
-    # get random noise detections
+    # Pre-filter random noise
     random_noise_detections = [det for det in all_frame_detections if det[3] == NoiseType.RANDOM_CLUTTER]
     
-    # 3. Iterate and process each object
+    # 2. Iterate and process each object
     for object_id, detections in grouped_detections.items():
         
+        # --- 2.1 Extract Data based on Object ID ---
+        real_positions, real_velocities = [], []
+        comp_positions, comp_velocities = [], [] # "Comparison" data (either Multipath or Random)
         
-        # --- 2.1 Extract and Filter Data: Split Noise Types ---
-        real_disp_errors = []
-        multipath_disp_errors, random_disp_errors = [], []
-        
-        real_positions, multipath_positions, random_positions = [], [], []
-        real_velocities, multipath_velocities, random_velocities = [], [], []
-        real_pred_vel_vectors = []
+        # Labels and Colors configuration
+        comp_label_name = ""
+        comp_color = ""
 
+        # Ground Truth (Assumed to be in the first detection of the group)
         gt_vel_radar = detections[0][5]
-        gt_vel_world = detections[0][6]
 
+        # Extract REAL data for this object
         for det in detections:
-            vel_mag, vel_err, disp_err, noiseType, pos_3d, pred_vel, _, _ = det[:8]
-            if noiseType == NoiseType.REAL:
-                real_disp_errors.append(disp_err)
-                real_positions.append(pos_3d); real_velocities.append(pred_vel)
-                real_pred_vel_vectors.append(pred_vel)
-            elif noiseType == NoiseType.MULTIPATH_GHOST:
-                multipath_disp_errors.append(disp_err)
-                multipath_positions.append(pos_3d); multipath_velocities.append(pred_vel)
+            if det[3] == NoiseType.REAL:
+                real_positions.append(det[4])
+                real_velocities.append(det[5])
 
-        for det in random_noise_detections:
-            _, _, disp_err, noiseType, pos_3d, pred_vel, _, _ = det[:8]
-            random_disp_errors.append(disp_err)
-            random_positions.append(pos_3d); random_velocities.append(pred_vel)
-
-
-        
-        # --- 2.2 Calculate Mean Velocities and Errors ---
-        real_disp_np = np.array(real_disp_errors)
-        multipath_disp_np = np.array(multipath_disp_errors)
-        random_disp_np = np.array(random_disp_errors)
-        
-        # Calculate averages based on the split lists
-        pred_vel_avg_radar = np.mean(np.array(real_pred_vel_vectors), axis=0) if real_pred_vel_vectors else np.array([0.0, 0.0, 0.0])
-        pred_vel_avg_multipath = np.mean(np.array(multipath_velocities), axis=0) if multipath_velocities else np.array([0.0, 0.0, 0.0])
-        pred_vel_avg_random = np.mean(np.array(random_velocities), axis=0) if random_velocities else np.array([0.0, 0.0, 0.0])
-        
-        # MAE calculation (Mean Absolute Component Error between Avg Real Vector and GT Vector)
-        if real_pred_vel_vectors:
-            error_vector_avg = pred_vel_avg_radar - gt_vel_radar
-            mae = np.mean(np.abs(error_vector_avg))
-        else:
-            mae = 0.0
-
-        # 1. Average Closest Distance within Real Positions (meters)
-        dist_R_pos_internal = calculate_avg_intra_set_distance(real_positions)
-        
-        # 2. Average Closest Distance within Multipath Positions (meters)
-        dist_MP_pos_internal = calculate_avg_intra_set_distance(multipath_positions)
-        
-        # 3. Average Closest Distance within Real Velocities (m/s)
-        dist_R_vel_internal = calculate_avg_intra_set_distance(real_velocities)
-        
-        # 4. Average Closest Distance within Multipath Velocities (m/s)
-        dist_MP_vel_internal = calculate_avg_intra_set_distance(multipath_velocities)
-
-        # Calculate Cohesion Ratios (Scaling Factors) ---
-        
-        epsilon = 1e-6 # To avoid division by zero
-        
-        # Real Cohesion Ratio (Velocity / Position)
-        if dist_R_pos_internal > epsilon:
-            cohesion_ratio_R = dist_R_vel_internal / dist_R_pos_internal
-        else:
-            cohesion_ratio_R = 999.0 # Use a large sentinel value if points are perfectly stacked
+        # Extract COMPARISON data (Branching Logic)
+        if object_id == 0:
+            # Case: Object 0 -> Compare against RANDOM NOISE
+            comp_label_name = "Random"
+            comp_color = "purple"
             
-        # Multipath Cohesion Ratio (Velocity / Position)
-        if dist_MP_pos_internal > epsilon:
-            cohesion_ratio_MP = dist_MP_vel_internal / dist_MP_pos_internal
+            for det in random_noise_detections:
+                comp_positions.append(det[4])
+                comp_velocities.append(det[5])
         else:
-            cohesion_ratio_MP = 999.0 # Use a large sentinel value
+            # Case: Other Objects -> Compare against MULTIPATH
+            comp_label_name = "Multi"
+            comp_color = "red"
+            
+            for det in detections:
+                if det[3] == NoiseType.MULTIPATH_GHOST:
+                    comp_positions.append(det[4])
+                    comp_velocities.append(det[5])
+
+        # Convert to numpy
+        real_pos_np = np.array(real_positions) if real_positions else np.empty((0, 3))
+        real_vel_np = np.array(real_velocities) if real_velocities else np.empty((0, 3))
         
-        # --- 3.2 Setup Directories and Header ---
+        comp_pos_np = np.array(comp_positions) if comp_positions else np.empty((0, 3))
+        comp_vel_np = np.array(comp_velocities) if comp_velocities else np.empty((0, 3))
+
+        # --- 2.2 Calculate Scales (Global Limits) ---
+        
+        # A. Global Component Limits (Row 1: Vx, Vy, Vz)
+        all_vel_values = []
+        if real_vel_np.size > 0: all_vel_values.append(real_vel_np.flatten())
+        if comp_vel_np.size > 0: all_vel_values.append(comp_vel_np.flatten())
+        all_vel_values.append(gt_vel_radar)
+        
+        combined_vel = np.concatenate(all_vel_values)
+        v_min, v_max = np.min(combined_vel), np.max(combined_vel)
+        
+        v_range = v_max - v_min
+        if v_range == 0: v_range = 1.0
+        global_v_min = v_min - (v_range * 0.1)
+        global_v_max = v_max + (v_range * 0.1)
+        
+        shared_bins_comp = np.linspace(global_v_min, global_v_max, 30)
+
+        # B. Global Magnitude Limits (Rows 2 & 3: Vxy, Vyz, Vxz, Vxyz)
+        max_mag = 0.0
+        if real_vel_np.size > 0:
+            max_mag = max(max_mag, np.max(np.linalg.norm(real_vel_np, axis=1)))
+        if comp_vel_np.size > 0:
+            max_mag = max(max_mag, np.max(np.linalg.norm(comp_vel_np, axis=1)))
+        max_mag = max(max_mag, np.linalg.norm(gt_vel_radar))
+
+        global_mag_max = max_mag * 1.1
+        shared_bins_mag = np.linspace(0, global_mag_max, 30)
+
+        # --- 2.3 Setup Directories ---
         object_output_dir = os.path.join(output_dir, f"object_{object_id:04d}")
         os.makedirs(object_output_dir, exist_ok=True)
         
-        gt_rad_str = f"({gt_vel_radar[0]:.2f}, {gt_vel_radar[1]:.2f}, {gt_vel_radar[2]:.2f})"
-        gt_wld_str = f"({gt_vel_world[0]:.2f}, {gt_vel_world[1]:.2f}, {gt_vel_world[2]:.2f})"
-        avg_pred_str = f"({pred_vel_avg_radar[0]:.2f}, {pred_vel_avg_radar[1]:.2f}, {pred_vel_avg_radar[2]:.2f})"
-
         header_text = (
-            f"Real Points: {len(real_positions)} | Multipath: {len(multipath_positions)} | Random Noise: {len(random_positions)}\n"
-            f"GT Velocity (RADAR): {gt_rad_str} | GT Velocity (WORLD): {gt_wld_str}\n"
-            f"Avg PD Velocity (RADAR, Real Only): {avg_pred_str} | MAE (Vector Diff): {mae:.4f} m/s"
-            f"Average Internal Cohesion (Nearest Neighbor Distances):\n"
-            f"  Pos Cohesion: Real={dist_R_pos_internal:.3f}m | MP={dist_MP_pos_internal:.3f}m\n"
-            f"  Vel Cohesion: Real={dist_R_vel_internal:.3f}m/s | MP={dist_MP_vel_internal:.3f}m/s"
-            f"Cohesion Scaling (Vel/Pos Ratio):\n"
-            f"  Real Ratio (V/P): {cohesion_ratio_R:.3f} | MP Ratio (V/P): {cohesion_ratio_MP:.3f}"
+            f"Counts: Real={len(real_positions)} | {comp_label_name}={len(comp_positions)}\n"
+            f"GT Velocity: ({gt_vel_radar[0]:.2f}, {gt_vel_radar[1]:.2f}, {gt_vel_radar[2]:.2f})"
         )
         
-        # --- 3.3 Generate Image Projection ---
+        # --- 2.4 Generate Image Projection ---
         try:
-            # Note: image_rgb is assumed to be RGB, but cv2 functions require BGR.
             image_bgr_to_draw = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
-            all_detections = detections + random_noise_detections
+            # RULE: Only include random noise points if object_id is 0
+            if object_id == 0:
+                detections_for_projection = detections + random_noise_detections
+            else:
+                detections_for_projection = detections
 
             points_2d, _, full_object_mask = project_and_get_depths(
-                all_detections, T_Cam_from_Radar, K
+                detections_for_projection, T_Cam_from_Radar, K
             )
+            
             image_with_points = draw_points_by_noise(
-                image_bgr_to_draw, all_detections, points_2d, full_object_mask
+                image_bgr_to_draw, detections_for_projection, points_2d, full_object_mask
             )
 
             image_save_path = os.path.join(object_output_dir, f"frame_{frame_number:08d}_projection.png")
             cv2.imwrite(image_save_path, image_with_points)
             
         except Exception as e:
-            # Placeholder/Error handling if image ops fail
-            pass
+            print(f"Error generating projection image for obj {object_id}: {e}")
         
 
-        # --- 3.4 Plotting (Statistical Analysis: 2x3 Grid) ---
-
+        # --- 2.5 Plotting (3x3 Grid) ---
         plt.style.use('ggplot')
-        fig, axes = plt.subplots(2, 3, figsize=(26, 18)) 
+        fig, axes = plt.subplots(3, 3, figsize=(26, 24)) 
         
-        fig.suptitle(f'Frame {frame_number} - Object ID {object_id} Analysis', fontsize=22, y=0.98) 
+        fig.suptitle(f'Frame {frame_number} - Object ID {object_id} Velocity Analysis ({comp_label_name} Mode)', fontsize=22, y=0.98) 
         fig.text(
-            0.5, 0.92, header_text, 
+            0.5, 0.94, header_text, 
             ha='center', fontsize=14, family='monospace', 
-            bbox=dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.8')
+            bbox=dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.5')
         )
+
+        # Helper: Plot Component (Row 1)
+        def plot_comp(ax, real_d, comp_d, gt_v, title):
+            if real_d.size > 0:
+                ax.hist(real_d, bins=shared_bins_comp, color='blue', alpha=0.6, label=f'Real ($\sigma$={np.std(real_d):.2f})')
+            if comp_d.size > 0:
+                ax.hist(comp_d, bins=shared_bins_comp, color=comp_color, alpha=0.5, label=f'{comp_label_name} ($\sigma$={np.std(comp_d):.2f})')
+            ax.axvline(gt_v, color='green', ls='--', lw=3, label=f'GT: {gt_v:.2f}')
+            ax.set_title(title); ax.set_xlim(global_v_min, global_v_max); ax.legend(fontsize=9)
+
+        # Helper: Plot Magnitude (Rows 2 & 3)
+        def plot_mag(ax, real_vec, comp_vec, gt_vec, idxs, title):
+            # Extract magnitude based on indices (e.g., [0,1] for xy)
+            r_mag = np.linalg.norm(real_vec[:, idxs], axis=1) if real_vec.size > 0 else np.array([])
+            c_mag = np.linalg.norm(comp_vec[:, idxs], axis=1) if comp_vec.size > 0 else np.array([])
+            gt_mag = np.linalg.norm(gt_vec[idxs])
+            
+            if r_mag.size > 0:
+                ax.hist(r_mag, bins=shared_bins_mag, color='blue', alpha=0.6, label=f'Real ($\sigma$={np.std(r_mag):.2f})')
+            if c_mag.size > 0:
+                ax.hist(c_mag, bins=shared_bins_mag, color=comp_color, alpha=0.5, label=f'{comp_label_name} ($\sigma$={np.std(c_mag):.2f})')
+            ax.axvline(gt_mag, color='green', ls='--', lw=3, label=f'GT: {gt_mag:.2f}')
+            ax.set_title(title); ax.set_xlim(0, global_mag_max); ax.legend(fontsize=9)
+
+        # === ROW 1: COMPONENTS (Vx, Vy, Vz) ===
+        plot_comp(axes[0,0], real_vel_np[:,0] if real_vel_np.size else np.array([]), comp_vel_np[:,0] if comp_vel_np.size else np.array([]), gt_vel_radar[0], "Vx (m/s)")
+        plot_comp(axes[0,1], real_vel_np[:,1] if real_vel_np.size else np.array([]), comp_vel_np[:,1] if comp_vel_np.size else np.array([]), gt_vel_radar[1], "Vy (m/s)")
+        plot_comp(axes[0,2], real_vel_np[:,2] if real_vel_np.size else np.array([]), comp_vel_np[:,2] if comp_vel_np.size else np.array([]), gt_vel_radar[2], "Vz (m/s)")
+
+        # === ROW 2: 2D MAGNITUDES (Vxy, Vyz, Vxz) ===
+        # Vxy (Indices 0, 1)
+        plot_mag(axes[1,0], real_vel_np, comp_vel_np, gt_vel_radar, [0, 1], "Horizontal Speed ($|V_{xy}|$)")
+        # Vyz (Indices 1, 2)
+        plot_mag(axes[1,1], real_vel_np, comp_vel_np, gt_vel_radar, [1, 2], "Side Profile Speed ($|V_{yz}|$)")
+        # Vxz (Indices 0, 2)
+        plot_mag(axes[1,2], real_vel_np, comp_vel_np, gt_vel_radar, [0, 2], "Front Profile Speed ($|V_{xz}|$)")
+
+        # === ROW 3: TOTAL MAGNITUDE & 3D CLUSTERS ===
         
-        # --- Shared Limits Setup ---
-        all_disp_data_hist = np.concatenate((real_disp_np, multipath_disp_np, random_disp_np)) if real_disp_np.size + multipath_disp_np.size + random_disp_np.size > 0 else np.array([])
+        # 3.1 Total Speed (Indices 0,1,2)
+        plot_mag(axes[2,0], real_vel_np, comp_vel_np, gt_vel_radar, [0, 1, 2], "Total Speed ($|V_{xyz}|$)")
+
+        # 3.2 3D Position
+        axes[2,1].remove(); ax_pos = fig.add_subplot(3, 3, 8, projection='3d')
+        if real_pos_np.size: ax_pos.scatter(real_pos_np[:,0], real_pos_np[:,1], real_pos_np[:,2], c='b', s=15, alpha=0.6, label='Real')
+        if comp_pos_np.size: ax_pos.scatter(comp_pos_np[:,0], comp_pos_np[:,1], comp_pos_np[:,2], c=comp_color, s=15, alpha=0.4, label=comp_label_name)
+        ax_pos.set_title("3D Position"); ax_pos.set_xlabel("X"); ax_pos.set_ylabel("Y"); ax_pos.set_zlabel("Z"); ax_pos.legend()
+
+        # 3.3 3D Velocity
+        axes[2,2].remove(); ax_vel = fig.add_subplot(3, 3, 9, projection='3d')
+        if real_vel_np.size: ax_vel.scatter(real_vel_np[:,0], real_vel_np[:,1], real_vel_np[:,2], c='b', s=15, alpha=0.6, label='Real')
+        if comp_vel_np.size: ax_vel.scatter(comp_vel_np[:,0], comp_vel_np[:,1], comp_vel_np[:,2], c=comp_color, s=15, alpha=0.4, label=comp_label_name)
+        ax_vel.scatter([gt_vel_radar[0]], [gt_vel_radar[1]], [gt_vel_radar[2]], c='g', s=100, marker='*', label='GT')
+        ax_vel.set_title("3D Velocity"); ax_vel.set_xlabel("Vx"); ax_vel.set_ylabel("Vy"); ax_vel.set_zlabel("Vz")
         
-        def get_shared_limits(data_array: np.ndarray):
-            if data_array.size == 0: return 0, 1
-            data_min, data_max = np.min(data_array), np.max(data_array)
-            if data_min == data_max: data_min -= 0.5; data_max += 0.5
-            padding = (data_max - data_min) * 0.05
-            return data_min - padding, data_max + padding
-        
-        disp_min, disp_max = get_shared_limits(all_disp_data_hist)
-        disp_bins = np.linspace(disp_min, disp_max, 21) if all_disp_data_hist.size > 0 else 20
-        
-        # === ROW 1: VELOCITY, DISPLACEMENT HISTOGRAMS ===
+        limit = max(5.0, np.max(np.abs(combined_vel)) * 1.1) if 'combined_vel' in locals() else 5.0
+        ax_vel.set_xlim([-limit, limit]); ax_vel.set_ylim([-limit, limit]); ax_vel.set_zlim([-limit, limit]); ax_vel.legend()
 
-        # --- Row 1, Col 1 (axes[0, 0]): GT vs. Predicted Velocity Vector (Bar Graph) ---
-        ax = axes[0, 0]
-        gt_vec = gt_vel_radar
-        pred_vec_real = pred_vel_avg_radar 
-        pred_vec_mp = pred_vel_avg_multipath 
-
-        labels = [r'$V_x$', r'$V_y$', r'$V_z$']
-        x = np.arange(len(labels)) 
-        width = 0.25
-
-        max_val = np.max(np.abs(np.concatenate([gt_vec, pred_vec_real, pred_vec_mp])))
-        limit = max(1.0, max_val * 1.2) 
-
-        # Create the bars (shifted for 3 groups)
-        rects1 = ax.bar(x - width, gt_vec, width, label='GT Velocity', color='#1f77b4') 
-        rects2 = ax.bar(x, pred_vec_real, width, label='PD Velocity (Avg Real)', color='#ff7f0e') 
-        rects3 = ax.bar(x + width, pred_vec_mp, width, label='PD Velocity (Avg Multipath)', color='#2ca02c') 
-        
-        ax.set_ylabel('Velocity (m/s)')
-        ax.set_title(f'GT vs. Predicted Velocity Vector (Radar Coords)')
-        ax.set_xticks(x); ax.set_xticklabels(labels)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(axis='y', linestyle='--'); ax.set_ylim(-limit, limit) 
-
-        # --- Row 1, Col 2 (axes[0, 1]): Real Displacement Error (Histogram) ---
-        ax = axes[0, 1]
-        if real_disp_np.size > 0:
-            mean_val = np.mean(real_disp_np)
-            ax.hist(real_disp_np, bins=disp_bins, color='blue', alpha=0.7, edgecolor='black')
-            ax.axvline(mean_val, color='red', linestyle='dashed', linewidth=2)
-            ax.set_title(f"Real Displacement Error (N={len(real_disp_np)})\nMean: {mean_val:.4f} pix")
-            ax.set_xlabel("Displacement Error (pixels)")
-            if all_disp_data_hist.size > 0: ax.set_xlim(disp_bins[0], disp_bins[-1])
-        else: ax.set_title("Real Displacement Error\n(No Data)"); ax.set_ylabel("Count")
-
-        # --- Row 1, Col 3 (axes[0, 2]): Multipath Displacement Error (Histogram) ---
-        ax = axes[0, 2]
-        if multipath_disp_np.size > 0:
-            mean_val = np.mean(multipath_disp_np)
-            ax.hist(multipath_disp_np, bins=disp_bins, color='purple', alpha=0.7, edgecolor='black') 
-            ax.axvline(mean_val, color='red', linestyle='dashed', linewidth=2)
-            ax.set_title(f"Multipath Displacement Error (N={len(multipath_disp_np)})\nMean: {mean_val:.4f} pix") 
-            ax.set_xlabel("Displacement Error (pixels)")
-            if all_disp_data_hist.size > 0: ax.set_xlim(disp_bins[0], disp_bins[-1])
-        else: ax.set_title("Multipath Displacement Error\n(No Data)"); ax.set_ylabel("Count")
-
-        # === ROW 2: RANDOM DISPLACEMENT, 3D POSITION, AND 3D VELOCITY ===
-
-        # --- Row 2, Col 1 (axes[1, 0]): Random Noise Displacement Error (Histogram) ---
-        ax = axes[1, 0]
-        if random_disp_np.size > 0:
-            mean_val = np.mean(random_disp_np)
-            ax.hist(random_disp_np, bins=disp_bins, color='red', alpha=0.7, edgecolor='black')
-            ax.axvline(mean_val, color='blue', linestyle='dashed', linewidth=2)
-            ax.set_title(f"Random Noise Disp. Error (N={len(random_disp_np)})\nMean: {mean_val:.4f} pix") 
-            ax.set_xlabel("Displacement Error (pixels)")
-            if all_disp_data_hist.size > 0: ax.set_xlim(disp_bins[0], disp_bins[-1])
-        else: ax.set_title("Random Noise Disp. Error\n(No Data)"); ax.set_ylabel("Count")
-
-        # --- Row 2, Col 2 (axes[1, 1]): 3D Position (Radar Coords) ---
-        axes[1, 1].remove(); ax_pos = fig.add_subplot(2, 3, 5, projection='3d')
-        if real_positions:
-            real_pos_np = np.array(real_positions)
-            ax_pos.scatter(real_pos_np[:, 0], real_pos_np[:, 1], real_pos_np[:, 2], c='blue', s=10, label=f'Real (N={len(real_pos_np)})', alpha=0.5)
-        if multipath_positions:
-            multipath_pos_np = np.array(multipath_positions)
-            ax_pos.scatter(multipath_pos_np[:, 0], multipath_pos_np[:, 1], multipath_pos_np[:, 2], c='red', s=5, label=f'Mulitpath (N={len(multipath_pos_np)})', alpha=0.4)
-        ax_pos.set_title("3D Position (Radar Coordinates)"); ax_pos.set_xlabel("X (m)"); ax_pos.set_ylabel("Y (m)"); ax_pos.set_zlabel("Z (m)"); ax_pos.legend()
-
-        # --- Row 2, Col 3 (axes[1, 2]): 3D Solved Velocity (Radar Coords) ---
-        axes[1, 2].remove(); ax_vel = fig.add_subplot(2, 3, 6, projection='3d')
-        if real_velocities:
-            real_vel_np = np.array(real_velocities)
-            ax_vel.scatter(real_vel_np[:, 0], real_vel_np[:, 1], real_vel_np[:, 2], c='blue', s=10, label=f'Real (N={len(real_vel_np)})', alpha=0.5)
-        if multipath_velocities:
-            multipath_vel_np = np.array(multipath_velocities)
-            ax_vel.scatter(multipath_vel_np[:, 0], multipath_vel_np[:, 1], multipath_vel_np[:, 2], c='red', s=5, label=f'Multipath (N={len(multipath_vel_np)})', alpha=0.4)
-        ax_vel.set_title("3D Solved Velocity (Radar Coords)"); ax_vel.set_xlabel("Vx (m/s)"); ax_vel.set_ylabel("Vy (m/s)"); ax_vel.set_zlabel("Vz (m/s)"); ax_vel.legend()
-        limit = 5; ax_vel.set_xlim([-limit, limit]); ax_vel.set_ylim([-limit, limit]); ax_vel.set_zlim([-limit, limit])
-
-        # --- 3.5 Save and Close ---
-        plt.tight_layout(rect=[0, 0.03, 1, 0.90]) 
+        # --- Save ---
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
         save_path = os.path.join(object_output_dir, f"frame_{frame_number:08d}_analysis.png")
         plt.savefig(save_path, dpi=100)
         plt.close(fig)

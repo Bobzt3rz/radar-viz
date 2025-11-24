@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 # --- Import all the original logic modules ---
 from modules.utils import save_image, save_frame_histogram, save_clustering_analysis_plot, save_frame_histogram_by_object, save_cluster_survivor_analysis
-from modules.clustering import cluster_detections_6d
+from modules.clustering import cluster_detections_6d, cluster_detections_anisotropic, filter_clusters_median
 from modules.types import NoiseType, DetectionTuple, Vector3, Matrix4x4, FlowField
 from modules.velocity_solver import solve_full_velocity, calculate_reprojection_error
 from modules.tracking import ClusterTracker
@@ -109,110 +109,97 @@ def estimate_velocities_from_data(
 
     if flow is None:
         return frame_results 
-
+    
     try:
-        T_Cam_from_Radar_static = np.linalg.inv(T_A_to_R)
+        # T_Cam_from_Radar: Used to project Radar points into Camera Frame
+        T_Cam_from_Radar = np.linalg.inv(T_A_to_R)
+        
+        # T_B_to_A: Used to calculate 'd_static' (Back-projecting current point)
+        T_B_to_A = np.linalg.inv(T_A_to_B)
     except np.linalg.LinAlgError:
-        print("  Error inverting T_A_to_R to find static extrinsic.")
         return frame_results
 
     # 3. Process each detection
     for detection in radar_detections:
-        point_radar_coords = detection.position_local
-        speed_radial = detection.radial_velocity
+        point_radar_coords = np.array(detection.position_local, dtype=float)
+
         noiseType = detection.noise_type
-        object_id = detection.object_id
-        # This is the GT we will compare against
-        ground_truth_vel_radar = detection.velocity_gt_radar
-        # This is just for visualization
-        ground_truth_vel_world = detection.velocity_gt_world
-
+        
+        # 1. Project Radar Point (Current) -> Camera Frame (Current/B)
         point_rad_h = np.append(point_radar_coords, 1.0)
-        point_cam_B_h = T_Cam_from_Radar_static @ point_rad_h
-        point_cam_B = point_cam_B_h[:3]
+        point_cam_B = (T_Cam_from_Radar @ point_rad_h)[:3]
+        
         depth_B = point_cam_B[2]
-
         if depth_B <= 1e-3: continue 
 
+        # 2. Get Optical Flow Pixels
+        # Current Pixel (u_q, v_q)
         uq = point_cam_B[0] / depth_B
         vq = point_cam_B[1] / depth_B
 
         xq_pix_f = camera.fx * uq + camera.cx
         yq_pix_f = camera.fy * vq + camera.cy
-        xq_pix = int(round(xq_pix_f))
-        yq_pix = int(round(yq_pix_f))
+        xq_pix, yq_pix = int(round(xq_pix_f)), int(round(yq_pix_f))
 
         if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
             continue
         
+        # Previous Pixel (u_p, v_p) using Flow
         dx, dy = flow[yq_pix, xq_pix]
-  
         xp_pix_f = xq_pix_f - dx
         yp_pix_f = yq_pix_f - dy
 
         up = (xp_pix_f - camera.cx) / camera.fx
         vp = (yp_pix_f - camera.cy) / camera.fy
 
-        # need radial velocity in camera coordinate system
-        dist_radar = np.linalg.norm(point_radar_coords)
-        if dist_radar > 1e-3:
-            # Unit ray in Radar Frame
-            ray_radar = point_radar_coords / dist_radar 
-            # Full velocity vector in Radar Frame (assuming pure radial motion)
-            vel_vec_radar = ray_radar * speed_radial
-            # Rotate to Camera Frame
-            R_Cam_from_Radar = T_Cam_from_Radar_static[0:3, 0:3]
-            vel_vec_cam = R_Cam_from_Radar @ vel_vec_radar
-            # Extract Z component (Depth Velocity)
-            v_z_cam = vel_vec_cam[2]
-        else:
-            v_z_cam = 0.0
-
         # Call the solver with the inputs directly from our files
         full_vel_vector_radar = solve_full_velocity(
-            up=up, vp=vp, uq=uq, vq=vq, d=depth_B, delta_t=world_delta_t,
-            T_A_to_B=T_A_to_B, T_A_to_R=T_A_to_R,
-            speed_radial=v_z_cam, point_radar_coords=point_radar_coords,
-            return_in_radar_coords=True
+            up=up, vp=vp, 
+            uq=uq, vq=vq,
+            point_cam_B=point_cam_B,     # Point in Current Frame
+            delta_t=world_delta_t,
+            T_A_to_B=T_A_to_B,           # Forward Motion (For Matrix Construction)
+            T_B_to_A=T_B_to_A,           # Backward Motion (For Depth/Gradient calc)
+            T_A_to_R=T_A_to_R,           # Extrinsic
+            speed_radial=detection.radial_velocity,
+            point_radar_coords=point_radar_coords
         )
         
         if full_vel_vector_radar is not None:
             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
             
             frame_displacement_error = calculate_reprojection_error(
-                full_vel_radar_A=full_vel_vector_radar,
+                full_vel_radar=full_vel_vector_radar,
                 point_radar_B=point_radar_coords,
-                T_Cam_from_Radar=T_Cam_from_Radar_static,
-                T_CamB_from_CamA=T_A_to_B,
+                T_Cam_from_Radar=T_Cam_from_Radar,
+                T_B_to_A=T_B_to_A,       # Pass explicit back-transform
                 flow=flow, 
                 camera=camera, 
                 xq_pix_f=xq_pix_f, 
                 yq_pix_f=yq_pix_f, 
-                delta_t=world_delta_t,
-                depth=depth_B,
-                noiseType=noiseType
+                delta_t=world_delta_t
             )
              
             if frame_displacement_error is not None:
                 if noiseType == NoiseType.REAL and detection.object_type == 1:
                     # --- FIX: Compare Radar-to-Radar ---
                     velocity_error_magnitude = float(np.linalg.norm(
-                        full_vel_vector_radar - ground_truth_vel_radar
+                        full_vel_vector_radar - detection.velocity_gt_radar
                     ))
                     # print(f"vel_radar: {full_vel_vector_radar}, vel_gt: {ground_truth_vel_radar}, flow: {flow[yq_pix, xq_pix]}")
                     frame_results.append((full_vel_magnitude, 
                                           velocity_error_magnitude, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_radar,
-                                          object_id))
+                                          detection.velocity_gt_radar,
+                                          detection.object_id))
                 else:
                     frame_results.append((full_vel_magnitude, 
                                           0.0, frame_displacement_error, 
                                           noiseType, point_radar_coords, 
                                           full_vel_vector_radar, # Prediction (Radar)
-                                          ground_truth_vel_radar,
-                                          object_id))
+                                          detection.velocity_gt_radar,
+                                          detection.object_id))
             
     return frame_results
 
@@ -319,11 +306,19 @@ if __name__ == "__main__":
             # --- D. Run Analysis (All this code is identical) ---
             
             if current_frame_errors:
-                clusters, noise_points = cluster_detections_6d(
-                    detections=current_frame_errors,
-                    # need to optimize these
-                    eps=4.5, min_samples=3, velocity_weight=5.0   
-                )
+                # clusters, noise_points = cluster_detections_6d(
+                #     detections=current_frame_errors,
+                #     # need to optimize these
+                #     eps=4.5, min_samples=3, velocity_weight=5.0   
+                # )
+
+                clusters, cluster_noise_points = cluster_detections_anisotropic(detections=current_frame_errors, 
+                                                                        eps=1.5, min_samples=8, weight_vz=6, 
+                                                                        weight_vxy=3)
+                
+                clusters, filter_noise_points = filter_clusters_median(clusters, purge_threshold=3.0)
+
+                noise_points = cluster_noise_points + filter_noise_points
 
                 # 2. Run Temporal Filtering
                 # This returns ONLY the clusters that are temporally consistent
@@ -375,14 +370,14 @@ if __name__ == "__main__":
 
                 # save_cluster_survivor_analysis(frame_number=frame_count, clusters=clusters, output_dir="output/cluster_survivor_analysis")
    
-                # save_clustering_analysis_plot(
-                #     frame_number=frame_count,
-                #     clusters=clusters,
-                #     noise_points=noise_points,
-                #     output_dir="output/clustering_analysis"
-                # )
+                save_clustering_analysis_plot(
+                    frame_number=frame_count,
+                    clusters=clusters,
+                    noise_points=noise_points,
+                    output_dir="output/clustering_analysis"
+                )
 
-            # save_frame_histogram_by_object(frame_count, current_frame_errors, current_frame_rgb, np.linalg.inv(T_A_to_R_static), K_cam, "output/object_analysis")
+            save_frame_histogram_by_object(frame_count, current_frame_errors, current_frame_rgb, np.linalg.inv(T_A_to_R_static), K_cam, "output/object_analysis")
 
             if current_frame_errors:
                 real_velocity_errors = []
