@@ -3,52 +3,50 @@ import os
 import glob
 import numpy as np
 import cv2
+import concurrent.futures
+import itertools
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
 # --- Import all the original logic modules ---
-from modules.utils import save_image, save_frame_histogram, save_clustering_analysis_plot, save_frame_histogram_by_object, save_cluster_survivor_analysis
-from modules.clustering import cluster_detections_6d, cluster_detections_anisotropic, filter_clusters_median
-from modules.types import NoiseType, DetectionTuple, Vector3, Matrix4x4, FlowField
-from modules.velocity_solver import solve_full_velocity, calculate_reprojection_error
-from modules.tracking import ClusterTracker
+# Ensure these modules are accessible in the python path
+from modules.utils import save_clustering_analysis_plot, save_frame_error_histogram, plot_global_summary, save_frame_projections, GlobalErrorTracker
+from modules.clustering import cluster_detections_6d, filter_clusters_quantile, filter_clusters_mad, cluster_detections_perfect, filter_static_points
+from modules.types import NoiseType, DetectionTuple, Matrix4x4, FlowField
+from modules.velocity_solver import solve_full_velocity, calculate_reprojection_error, calculate_rigid_3d_velocities
+# Note: ClusterTracker is stateful (temporal). We cannot parallelize the tracker update itself easily,
+# but we can parallelize the detection/velocity steps.
 
 # --- NEW: Define the dataclass that bridges PLY to solver ---
 @dataclass
 class RadarDetection:
-    """A simple struct to hold data loaded from a PLY file."""
-    position_local: np.ndarray  # 3D (x,y,z) in sensor coords (Paper system)
+    position_local: np.ndarray
     radial_velocity: float
-    velocity_gt_radar: np.ndarray # 3D (vx,vy,vz) in RADAR coords (Paper system)
+    velocity_gt_radar: np.ndarray
     noise_type: NoiseType
-    # We also load the world GT for visualization, but don't use it in the solver
     velocity_gt_world: np.ndarray
     object_type: int
     object_id: int
+    position_gt_local: np.ndarray
+    angular_velocity_gt_radar: np.ndarray
+    center_gt_radar: np.ndarray
 
 # --- NEW: Mock Camera object for the solver ---
 class MockCamera:
-    """Mocks the Camera object with data loaded from files."""
     def __init__(self, K: np.ndarray):
         self._K = K
-        
         self.fx: float = K[0, 0]
         self.fy: float = K[1, 1]
         self.cx: float = K[0, 2]
         self.cy: float = K[1, 2]
-        
         self.image_width: int = int(round(self.cx * 2))
         self.image_height: int = int(round(self.cy * 2))
 
     def get_intrinsics_matrix(self) -> np.ndarray:
         return self._K
 
-# --- NEW: Helper function to load our ASCII PLY files ---
+# --- Helper function to load PLY ---
 def load_radar_ply(ply_path: str) -> List[RadarDetection]:
-    """
-    Loads radar detections from our specific ASCII PLY file format
-    and converts them into RadarDetection objects.
-    """
     try:
         with open(ply_path, 'r') as f:
             lines = f.readlines()
@@ -63,77 +61,58 @@ def load_radar_ply(ply_path: str) -> List[RadarDetection]:
         data_lines = lines[header_end_index + 1:]
         if not data_lines: return [] 
 
-        # x, y, z, az, el, r, v_rad, vx_gt, vy_gt, vz_gt, vx_w, vy_w, vz_w, noise, object_type, object_id
         data_array = np.loadtxt(data_lines, dtype=np.float32)
-
-        if data_array.ndim == 1:
-            data_array = data_array.reshape(1, -1)
+        if data_array.ndim == 1: data_array = data_array.reshape(1, -1)
             
         detections = []
         for row in data_array:
-            pos_local = np.array([row[0], row[1], row[2]], dtype=np.float32)
-            v_rad = float(row[6])
-            vel_gt_radar = np.array([row[7], row[8], row[9]], dtype=np.float32)
-            vel_gt_world = np.array([row[10], row[11], row[12]], dtype=np.float32)
-            noise_type = NoiseType(int(row[13]))
-            object_type = int(row[14])
-            object_id = int(row[15])
-            
             detections.append(RadarDetection(
-                position_local=pos_local,
-                radial_velocity=v_rad,
-                velocity_gt_radar=vel_gt_radar,
-                noise_type=noise_type,
-                velocity_gt_world=vel_gt_world,
-                object_type=object_type,
-                object_id=object_id
+                position_local=np.array([row[0], row[1], row[2]], dtype=np.float32),
+                radial_velocity=float(row[6]),
+                velocity_gt_radar=np.array([row[7], row[8], row[9]], dtype=np.float32),
+                noise_type=NoiseType(int(row[13])),
+                velocity_gt_world=np.array([row[10], row[11], row[12]], dtype=np.float32),
+                object_type=int(row[14]),
+                object_id=int(row[15]),
+                position_gt_local=np.array([row[16], row[17], row[18]], dtype=np.float32),
+                angular_velocity_gt_radar=np.array([row[19], row[20], row[21]], dtype=np.float32),
+                center_gt_radar=np.array([row[22], row[23], row[24]], dtype=np.float32)
             ))
         return detections
     except Exception as e:
-        print(f"Error loading PLY file {ply_path}: {e}")
+        # In multiprocessing, print might get messy, better to return empty
+        print(e)
         return []
 
-# --- REFACTORED: Solver logic based on your new plan ---
+# --- Solver logic ---
 def estimate_velocities_from_data(
     radar_detections: List[RadarDetection],
     flow: Optional[FlowField],
-    camera: MockCamera, # This just holds intrinsics
-    T_A_to_B: Matrix4x4, # <-- NEW: Relative pose
-    T_A_to_R: Matrix4x4, # <-- NEW: Static extrinsics
+    camera: MockCamera,
+    T_A_to_B: Matrix4x4,
+    T_A_to_R: Matrix4x4,
     world_delta_t: float
 ) -> List[DetectionTuple]:
-    """
-    Calculates full velocity for loaded radar detections.
-    """
+    
     frame_results: List[DetectionTuple] = []
-
-    if flow is None:
-        return frame_results 
+    if flow is None: return frame_results 
     
     try:
-        # T_Cam_from_Radar: Used to project Radar points into Camera Frame
         T_Cam_from_Radar = np.linalg.inv(T_A_to_R)
-        
-        # T_B_to_A: Used to calculate 'd_static' (Back-projecting current point)
         T_B_to_A = np.linalg.inv(T_A_to_B)
     except np.linalg.LinAlgError:
         return frame_results
 
-    # 3. Process each detection
     for detection in radar_detections:
         point_radar_coords = np.array(detection.position_local, dtype=float)
-
         noiseType = detection.noise_type
         
-        # 1. Project Radar Point (Current) -> Camera Frame (Current/B)
         point_rad_h = np.append(point_radar_coords, 1.0)
         point_cam_B = (T_Cam_from_Radar @ point_rad_h)[:3]
-        
         depth_B = point_cam_B[2]
+        
         if depth_B <= 1e-3: continue 
 
-        # 2. Get Optical Flow Pixels
-        # Current Pixel (u_q, v_q)
         uq = point_cam_B[0] / depth_B
         vq = point_cam_B[1] / depth_B
 
@@ -144,296 +123,252 @@ def estimate_velocities_from_data(
         if not (0 <= xq_pix < camera.image_width and 0 <= yq_pix < camera.image_height):
             continue
         
-        # Previous Pixel (u_p, v_p) using Flow
         dx, dy = flow[yq_pix, xq_pix]
         xp_pix_f = xq_pix_f - dx
         yp_pix_f = yq_pix_f - dy
-
         up = (xp_pix_f - camera.cx) / camera.fx
         vp = (yp_pix_f - camera.cy) / camera.fy
 
-        # Call the solver with the inputs directly from our files
         full_vel_vector_radar = solve_full_velocity(
-            up=up, vp=vp, 
-            uq=uq, vq=vq,
-            point_cam_B=point_cam_B,     # Point in Current Frame
-            delta_t=world_delta_t,
-            T_A_to_B=T_A_to_B,           # Forward Motion (For Matrix Construction)
-            T_B_to_A=T_B_to_A,           # Backward Motion (For Depth/Gradient calc)
-            T_A_to_R=T_A_to_R,           # Extrinsic
-            speed_radial=detection.radial_velocity,
-            point_radar_coords=point_radar_coords
+            up=up, vp=vp, uq=uq, vq=vq,
+            point_cam_B=point_cam_B, delta_t=world_delta_t,
+            T_A_to_B=T_A_to_B, T_B_to_A=T_B_to_A, T_A_to_R=T_A_to_R,
+            speed_radial=detection.radial_velocity, point_radar_coords=point_radar_coords
         )
         
         if full_vel_vector_radar is not None:
             full_vel_magnitude = float(np.linalg.norm(full_vel_vector_radar))
-            
             frame_displacement_error = calculate_reprojection_error(
-                full_vel_radar=full_vel_vector_radar,
-                point_radar_B=point_radar_coords,
-                T_Cam_from_Radar=T_Cam_from_Radar,
-                T_B_to_A=T_B_to_A,       # Pass explicit back-transform
-                flow=flow, 
-                camera=camera, 
-                xq_pix_f=xq_pix_f, 
-                yq_pix_f=yq_pix_f, 
-                delta_t=world_delta_t
+                full_vel_radar=full_vel_vector_radar, point_radar_B=point_radar_coords,
+                T_Cam_from_Radar=T_Cam_from_Radar, T_B_to_A=T_B_to_A, flow=flow, 
+                camera=camera, xq_pix_f=xq_pix_f, yq_pix_f=yq_pix_f, delta_t=world_delta_t
             )
              
             if frame_displacement_error is not None:
+                vel_err = 0.0
                 if noiseType == NoiseType.REAL and detection.object_type == 1:
-                    # --- FIX: Compare Radar-to-Radar ---
-                    velocity_error_magnitude = float(np.linalg.norm(
-                        full_vel_vector_radar - detection.velocity_gt_radar
-                    ))
-                    # print(f"vel_radar: {full_vel_vector_radar}, vel_gt: {ground_truth_vel_radar}, flow: {flow[yq_pix, xq_pix]}")
-                    frame_results.append((full_vel_magnitude, 
-                                          velocity_error_magnitude, frame_displacement_error, 
-                                          noiseType, point_radar_coords, 
-                                          full_vel_vector_radar, # Prediction (Radar)
-                                          detection.velocity_gt_radar,
-                                          detection.object_id))
-                else:
-                    frame_results.append((full_vel_magnitude, 
-                                          0.0, frame_displacement_error, 
-                                          noiseType, point_radar_coords, 
-                                          full_vel_vector_radar, # Prediction (Radar)
-                                          detection.velocity_gt_radar,
-                                          detection.object_id))
-            
+                    vel_err = float(np.linalg.norm(full_vel_vector_radar - detection.velocity_gt_radar))
+
+                frame_results.append((full_vel_magnitude, vel_err, frame_displacement_error, 
+                                      noiseType, point_radar_coords, full_vel_vector_radar, 
+                                      detection.velocity_gt_radar, detection.object_id, dx, dy, 
+                                      detection.position_gt_local, detection.angular_velocity_gt_radar, 
+                                      detection.center_gt_radar, detection.velocity_gt_world, np.array([0.0, 0.0, 0.0])))
     return frame_results
+
+# --- WORKER FUNCTION ---
+def process_single_frame(
+    frame_idx: int,
+    image_path_B: str,
+    pose_file_relative: str,
+    ply_file_B: str,
+    flow_file_B: str,
+    K_cam: np.ndarray,
+    T_A_to_R_static: Matrix4x4,
+    delta_t: float
+) -> Dict[str, Any]:
+    """
+    This function runs in a separate process. 
+    It loads data, runs the solver, runs clustering, saves plots, 
+    and returns the statistics to the main process.
+    """
+    
+    # Result container
+    result = {
+        'frame_idx': frame_idx,
+        'success': False,
+        'clusters': [],
+        'filtered_clusters': [],
+        'cluster_noise_points': [],
+        'filter_noise_points': []
+    }
+
+    # 1. Check Files
+    if not all(os.path.exists(f) for f in [image_path_B, pose_file_relative, ply_file_B, flow_file_B]):
+        return result
+
+    try:
+        # 2. Load Data
+        # Prevent OpenCV from spawning its own threads inside this process
+        cv2.setNumThreads(0) 
+        
+        current_frame_rgb = cv2.cvtColor(cv2.imread(image_path_B), cv2.COLOR_BGR2RGB)
+        T_A_to_B = np.loadtxt(pose_file_relative)
+        radar_detections = load_radar_ply(ply_file_B)
+        flow = np.load(flow_file_B)
+
+        if not radar_detections:
+            return result
+
+        # 3. Run Solver
+        mock_camera = MockCamera(K_cam)
+        detections = estimate_velocities_from_data(
+            radar_detections, flow, mock_camera,
+            T_A_to_B, T_A_to_R_static, delta_t
+        )
+
+        if not detections:
+            return result
+        
+        # filter out static points first
+        filtered_static_detections = filter_static_points(detections)
+
+        # 4. Clustering
+        clusters, cluster_noise_points = cluster_detections_6d(
+            detections=filtered_static_detections, 
+            eps=8.7205, min_samples=11, velocity_weight=2.5279
+        )
+
+        rigid_clusters = calculate_rigid_3d_velocities(clusters)
+
+        # clusters, cluster_noise_points = cluster_detections_perfect(filtered_static_detections)
+
+        filtered_clusters, filter_noise_points = filter_clusters_mad(rigid_clusters, std_threshold=(2.75, 3.25, 1.75))
+
+        noise_points = cluster_noise_points + filter_noise_points
+
+        result['clusters'] = rigid_clusters
+        result['filtered_clusters'] = filtered_clusters
+        result['cluster_noise_points'] = cluster_noise_points
+        result['filter_noise_points'] = filter_noise_points
+
+        save_frame_projections(frame_number=frame_idx, 
+                               detections=filtered_static_detections, 
+                               image_rgb=current_frame_rgb, 
+                               T_Cam_from_Radar=np.linalg.inv(T_A_to_R_static), 
+                               K=K_cam, 
+                               output_dir="output/projections")
+
+        flattened_clusters = list(itertools.chain.from_iterable(rigid_clusters))
+        save_frame_projections(frame_number=frame_idx, 
+                               detections=flattened_clusters, 
+                               image_rgb=current_frame_rgb, 
+                               T_Cam_from_Radar=np.linalg.inv(T_A_to_R_static), 
+                               K=K_cam, 
+                               output_dir="output/clustered_projections")
+        
+        flattened_filtered_clusters = list(itertools.chain.from_iterable(filtered_clusters))
+        save_frame_projections(frame_number=frame_idx, 
+                               detections=flattened_filtered_clusters, 
+                               image_rgb=current_frame_rgb, 
+                               T_Cam_from_Radar=np.linalg.inv(T_A_to_R_static), 
+                               K=K_cam, 
+                               output_dir="output/filtered_projections")
+
+        # 7. Save Visualizations (File I/O is fine here)
+        # Note: Matplotlib backends can sometimes be tricky in subprocesses. 
+        # Ensure utils uses a non-interactive backend (like Agg) if possible.
+        # save_clustering_analysis_plot(
+        #     frame_number=frame_idx,
+        #     clusters=filtered_clusters,
+        #     noise_points=noise_points,
+        #     output_dir="output/clustering_analysis"
+        # )
+
+        # frame_results_for_histo = save_frame_error_histogram(
+        #     frame_idx, filtered_static_detections, current_frame_rgb, 
+        #     np.linalg.inv(T_A_to_R_static), K_cam, "output/object_analysis"
+        # )
+
+        result['success'] = True
+        return result
+
+    except Exception as e:
+        print(f"Err Frame {frame_idx}: {e}")
+        return result
 
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
+    # Important for multiprocessing on Windows/MacOS
+    import multiprocessing
+    multiprocessing.freeze_support()
 
-    # --- 1. Define Paths and Constants ---
     CARLA_OUTPUT_DIR = "../carla/output"
-    DELTA_T = 0.05 # 20 FPS
-    
+    DELTA_T = 0.05
     CAM_DIR = os.path.join(CARLA_OUTPUT_DIR, "camera_rgb")
     PLY_DIR = os.path.join(CARLA_OUTPUT_DIR, "radar_ply")
     POSES_DIR = os.path.join(CARLA_OUTPUT_DIR, "poses")
     CALIB_DIR = os.path.join(CARLA_OUTPUT_DIR, "calib")
-    # FLOW_DIR = os.path.join(CARLA_OUTPUT_DIR, "flow_cv")
     FLOW_DIR = os.path.join(CARLA_OUTPUT_DIR, "flow")
 
-
-    # --- 2. Load Static Calibration ---
     try:
         K_cam = np.loadtxt(os.path.join(CALIB_DIR, "intrinsics.txt"))
-        # --- FIX: Load static extrinsics ---
         T_A_to_R_static = np.loadtxt(os.path.join(CALIB_DIR, "extrinsics_radar_from_camera.txt"))
     except Exception as e:
-        print(f"Error: Could not load calibration files. Exiting.")
-        print(f"Looked in: {CALIB_DIR}")
-        print(e)
+        print(f"Error loading calibration: {e}")
         sys.exit(1)
 
-    # --- 3. Initialize Processors and Stats ---
-    print("\nStarting data processing loop...")
-    
-    all_real_velocity_abs_errors = []
-    all_real_velocity_actual_magnitudes = []
-    all_tp, all_fp, all_fn, all_tn = [], [], [], []
-    
-    # --- 4. Find all frames to process ---
     all_image_files = sorted(glob.glob(os.path.join(CAM_DIR, "*.png")))
-    
     if not all_image_files:
-        print(f"Error: No images found in {CAM_DIR}. Did you run the Carla script?")
+        print(f"Error: No images found in {CAM_DIR}.")
         sys.exit(1)
         
     max_frames = len(all_image_files)
+    
+    # Global Aggregators
+    all_detections = []
+    all_clusters = []
+    all_filtered_clusters = []
+    all_cluster_noise_points = []
+    all_filter_noise_points = []
 
-    tracker = ClusterTracker(hit_threshold=3, max_history=2)
 
-    for frame_count in range(1, max_frames):
+    # error_tracker = GlobalErrorTracker()
+
+    print(f"\nStarting Parallel Processing on {os.cpu_count()} cores...")
+
+    # We use ProcessPoolExecutor to manage the worker processes
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        # Prepare the list of futures
+        futures = []
         
-        # We only need the files for the CURRENT frame (B)
-        image_path_B = all_image_files[frame_count]
-        frame_id_B = os.path.basename(image_path_B).split('.')[0]
-
-        pose_file_relative = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
-        ply_file_B = os.path.join(PLY_DIR, f"{frame_id_B}.ply")
-
-        flow_file_B = os.path.join(FLOW_DIR, f"{frame_id_B}.npy")
-        
-        required_files = [
-            image_path_B, 
-            pose_file_relative, 
-            ply_file_B,
-            flow_file_B
-        ]
-
-        if not all(os.path.exists(f) for f in required_files):
-            print(f"Warning: Missing one or more files for frame {frame_id_B}. Skipping.")
-            continue
-
-        # --- B. Load all data from disk ---
-        try:
-            current_frame_rgb = cv2.cvtColor(cv2.imread(image_path_B), cv2.COLOR_BGR2RGB)
+        for frame_count in range(1, max_frames):
+            image_path_B = all_image_files[frame_count]
+            frame_id_B = os.path.basename(image_path_B).split('.')[0]
+            pose_file_relative = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
+            ply_file_B = os.path.join(PLY_DIR, f"{frame_id_B}.ply")
+            flow_file_B = os.path.join(FLOW_DIR, f"{frame_id_B}.npy")
             
-            # Load the "diff" (ego-motion)
-            T_A_to_B = np.loadtxt(pose_file_relative)
-            
-            # Load detections from Frame B
-            radar_detections: List[RadarDetection] = load_radar_ply(ply_file_B)
-
-            flow = np.load(flow_file_B)
-            
-        except Exception as e:
-            print(f"Error loading data for frame {frame_id_B}: {e}. Skipping.")
-            continue
-
-        
-        print(f"--- Frame {frame_count} ({frame_id_B}) ---")
-        
-        if radar_detections:
-            # Mock camera just holds intrinsics now
-            mock_camera = MockCamera(K_cam)
-            
-            # --- FIX: Call the updated solver ---
-            current_frame_errors: List[DetectionTuple] = estimate_velocities_from_data(
-                radar_detections, 
-                flow, 
-                mock_camera,
-                T_A_to_B,         # Pass relative pose
-                T_A_to_R_static,  # Pass static extrinsics
+            # Submit task
+            futures.append(executor.submit(
+                process_single_frame,
+                frame_count,
+                image_path_B,
+                pose_file_relative,
+                ply_file_B,
+                flow_file_B,
+                K_cam,
+                T_A_to_R_static,
                 DELTA_T
-            )
+            ))
 
-            # --- D. Run Analysis (All this code is identical) ---
-            
-            if current_frame_errors:
-                # clusters, noise_points = cluster_detections_6d(
-                #     detections=current_frame_errors,
-                #     # need to optimize these
-                #     eps=4.5, min_samples=3, velocity_weight=5.0   
-                # )
-
-                clusters, cluster_noise_points = cluster_detections_anisotropic(detections=current_frame_errors, 
-                                                                        eps=1.5, min_samples=8, weight_vz=6, 
-                                                                        weight_vxy=3)
-                
-                clusters, filter_noise_points = filter_clusters_median(clusters, purge_threshold=3.0)
-
-                noise_points = cluster_noise_points + filter_noise_points
-
-                # 2. Run Temporal Filtering
-                # This returns ONLY the clusters that are temporally consistent
-                # confirmed_clusters = tracker.update(clusters, DELTA_T)
-                
-                # print(f"Frame {frame_count}: Raw Clusters: {len(clusters)} -> Confirmed: {len(confirmed_clusters)}")
-                
-                gt_real, gt_random, gt_multipath = 0, 0, 0
-                tp_pd_vectors = []
-                tp_gt_vectors = []
-
-                for det in current_frame_errors:
-                    vel_3d_radar_PD = det[5]
-                    vel_3d_radar_GT = det[6]
-                    
-                    if det[3] == NoiseType.REAL: 
-                        gt_real += 1
-                        tp_pd_vectors.append(vel_3d_radar_PD)
-                        tp_gt_vectors.append(vel_3d_radar_GT)
-                    elif det[3] == NoiseType.RANDOM_CLUTTER: gt_random += 1
-                    elif det[3] == NoiseType.MULTIPATH_GHOST: gt_multipath += 1
-                
-                total_real_points = gt_real
-                total_noisy_points = gt_random + gt_multipath
-
-                tp, fn = 0, 0
-                fp_random, fp_multipath = 0, 0
-                tn_random, tn_multipath = 0, 0
-                
-                for cluster in clusters:
-                    for det in cluster:
-                        if det[3] == NoiseType.REAL: tp += 1
-                        elif det[3] == NoiseType.RANDOM_CLUTTER: fp_random += 1
-                        elif det[3] == NoiseType.MULTIPATH_GHOST: fp_multipath += 1
-
-                for det in noise_points:
-                    if det[3] == NoiseType.REAL: fn += 1
-                    elif det[3] == NoiseType.RANDOM_CLUTTER: tn_random += 1
-                    elif det[3] == NoiseType.MULTIPATH_GHOST: tn_multipath += 1
-                
-                total_fp = fp_random + fp_multipath
-                total_tn = tn_random + tn_multipath
-                
-                precision = tp / (tp + total_fp) if (tp + total_fp) > 0 else 0.0
-                recall = tp / total_real_points if total_real_points > 0 else 0.0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-                all_tp.append(tp); all_fp.append(total_fp); all_fn.append(fn); all_tn.append(total_tn)
-
-                # save_cluster_survivor_analysis(frame_number=frame_count, clusters=clusters, output_dir="output/cluster_survivor_analysis")
-   
-                save_clustering_analysis_plot(
-                    frame_number=frame_count,
-                    clusters=clusters,
-                    noise_points=noise_points,
-                    output_dir="output/clustering_analysis"
-                )
-
-            save_frame_histogram_by_object(frame_count, current_frame_errors, current_frame_rgb, np.linalg.inv(T_A_to_R_static), K_cam, "output/object_analysis")
-
-            if current_frame_errors:
-                real_velocity_errors = []
-                real_vel_magnitudes = []
-                
-                for vel_mag, vel_err, disp_err, noiseType, pos_3d, vel_3d_radar, vel_3d_world_gt, obj_id in current_frame_errors:
-                    if(noiseType == NoiseType.REAL):
-                        real_vel_magnitudes.append(vel_mag)
-                        real_velocity_errors.append(vel_err)
-                
-                all_real_velocity_abs_errors.extend(real_velocity_errors)
-                all_real_velocity_actual_magnitudes.extend(real_vel_magnitudes)
-            
-        else:
-            print("  No radar detections loaded for this frame.")
-
-    # --- E. Final Results (Identical to original) ---
-    print("\nProcessing loop finished.")
-    print("\n" + "="*40)
-    print("--- Overall Simulation Results ---")
-    print("="*40)
-
-    print("\n### Clustering Filter Performance (All Frames) ###")
-    if all_tp: 
-        total_tp = sum(all_tp); total_fp = sum(all_fp); total_fn = sum(all_fn); total_tn = sum(all_tn)
-        overall_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-        overall_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-        overall_f1 = 2 * (overall_precision * overall_recall) / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0.0
-        total_real = total_tp + total_fn; total_noisy = total_fp + total_tn; total_all = total_real + total_noisy
+        # Process results as they complete
+        # Use as_completed to get results faster, or simply iterate if order matters strictly
+        # Here order doesn't matter for aggregation, but usually tracking requires order.
+        # Since we aren't running the ClusterTracker (temporal) update in the loop, order is fine.
         
-        print(f"  Total Ground Truth: {total_real} Real Points, {total_noisy} Noisy Points ({total_all} total)")
-        print(f"  - True Positives (TP): {total_tp:6d} (Real points correctly clustered)")
-        print(f"  - False Positives (FP): {total_fp:6d} (Noisy points incorrectly clustered)")
-        print(f"  - False Negatives (FN): {total_fn:6d} (Real points incorrectly filtered)")
-        print(f"  - True Negatives (TN): {total_tn:6d} (Noisy points correctly filtered)")
-        print(f"\n  --- Overall Scores ---")
-        print(f"  Precision (Cleanliness): {overall_precision * 100:6.2f}%")
-        print(f"  Recall (Completeness):   {overall_recall * 100:6.2f}%")
-        print(f"  F1-Score (Balance):      {overall_f1 * 100:6.2f}%")
-    else:
-        print("No clustering results were recorded.")
+        from tqdm import tqdm # Optional: for progress bar
+        
+        # If you don't have tqdm, just use: for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+            res = future.result()
+            
+            if res['success']:
+                all_detections.extend(
+                    [det for cluster in res['clusters'] for det in cluster] + 
+                    [det for cluster in res['cluster_noise_points'] for det in cluster])
+                all_clusters.extend(res['clusters'])
+                all_filtered_clusters.extend(res['filtered_clusters'])
+                all_cluster_noise_points.extend(res['cluster_noise_points'])
+                all_filter_noise_points.extend(res['filter_noise_points'])
+            
+            # If you want to print per frame (might be noisy with tqdm)
+            # print(f"Finished frame {res['frame_idx']}")
 
-    print("\n### Velocity Estimation Performance (on True Positives) ###")
-    if all_real_velocity_abs_errors and all_real_velocity_actual_magnitudes:
-        errors_array = np.array(all_real_velocity_abs_errors)
-        actuals_array = np.array(all_real_velocity_actual_magnitudes)
-        global_mae = np.mean(errors_array); mean_actual_speed = np.mean(actuals_array)
-        print(f"  Global Mean Absolute Error (MAE):   {global_mae:.6f} m/s")
-        print(f"  Mean Actual Object Speed:             {mean_actual_speed:.6f} m/s")
-        if mean_actual_speed > 1e-6:
-            global_nmae = (global_mae / mean_actual_speed) * 100.0
-            print(f"  Normalized MAE (NMAE):              {global_nmae:.2f} %")
-        else:
-            print("  Normalized MAE (NMAE):              N/A (Mean actual speed is zero)")
-        print(f"  (Based on {len(errors_array)} total True Positive detections)")
-    else:
-        print("  No valid True Positive detections were recorded to calculate an overall average.")
-
-    print("\nProcessing complete.")
+    # --- Final Reporting (Identical to original) ---
+    plot_global_summary(all_clusters, all_filtered_clusters, all_cluster_noise_points, all_filter_noise_points, 'output')
+    
+    # if all_real_velocity_abs_errors:
+    #     errors_array = np.array(all_real_velocity_abs_errors)
+    #     print(f"  Global MAE: {np.mean(errors_array):.6f} m/s")

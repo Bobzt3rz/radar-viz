@@ -2,251 +2,215 @@ import sys
 import os
 import glob
 import numpy as np
-import cv2
-import itertools
-from typing import List, Dict, Tuple, Set
-from collections import defaultdict, Counter
+import gc
+import signal
+import optuna
+from typing import List, Any, Optional, Tuple
+from collections import defaultdict
 from tqdm import tqdm
+from sklearn.metrics import homogeneity_completeness_v_measure
+from sklearn.cluster import DBSCAN
 
-# --- Import your specific modules ---
-from modules.clustering import cluster_detections_anisotropic # Use your NEW clustering function
-from modules.types import NoiseType, DetectionTuple
-from main_carla import load_radar_ply, estimate_velocities_from_data, MockCamera, RadarDetection
+# Keep your custom modules
+from modules.clustering import filter_static_points
+from modules.types import DetectionTuple
+from main_carla import load_radar_ply, estimate_velocities_from_data, MockCamera
 
-# --- CONFIGURATION: SEARCH RANGES ---
-PARAM_GRID = {
-    # Center around the current best (2.5)
-    'eps': [1.25, 1.5, 1.75], 
+# --- CONFIGURATION ---
+TIMEOUT_SECONDS = 5
 
-    # High density seems good
-    'min_samples': [4, 5, 6, 7],
+# --- Global Storage ---
+_shared_frames_data: List[np.ndarray] = [] 
+_shared_frames_gt: List[np.ndarray] = []
 
-    # Doppler is king. Let it go higher.
-    'weight_vz': [4, 5, 6, 7], 
+class TimeoutException(Exception): pass
+def timeout_handler(signum, frame): raise TimeoutException()
 
-    # TEST: Does a small penalty on transverse velocity help separate 
-    # side-by-side cars without losing ghosts?
-    'weight_vxy': [2.75, 3, 3.5], 
-}
+# --- Per-Frame Evaluation ---
+def evaluate_single_frame(
+    data_matrix: np.ndarray,
+    gt_ids: np.ndarray,
+    eps: float,
+    min_samples: int,
+    velocity_weight: float
+) -> float:
+    if data_matrix.shape[0] == 0:
+        return 0.0
 
-# --- 1. Data Loader (Unchanged) ---
-def cache_simulation_data(max_frames_to_load=None):
-    """
-    Loads flow, poses, and radar data, solves for velocity, 
-    and returns a list of ALL frame detections (unclustered).
-    """
-    print("--- Phase 1: Caching Simulation Data (Running Solver) ---")
-    
-    CARLA_OUTPUT_DIR = "../carla/output"
-    DELTA_T = 0.05
-    CAM_DIR = os.path.join(CARLA_OUTPUT_DIR, "camera_rgb")
-    PLY_DIR = os.path.join(CARLA_OUTPUT_DIR, "radar_ply")
-    POSES_DIR = os.path.join(CARLA_OUTPUT_DIR, "poses")
-    CALIB_DIR = os.path.join(CARLA_OUTPUT_DIR, "calib")
-    FLOW_DIR = os.path.join(CARLA_OUTPUT_DIR, "flow")
+    X = data_matrix.copy()
+    # Apply velocity weight
+    X[:, 3:6] *= velocity_weight
 
     try:
-        K_cam = np.loadtxt(os.path.join(CALIB_DIR, "intrinsics.txt"))
-        T_A_to_R_static = np.loadtxt(os.path.join(CALIB_DIR, "extrinsics_radar_from_camera.txt"))
-        mock_camera = MockCamera(K_cam)
-    except Exception as e:
-        print(f"Critical Error: Could not load calibration. {e}")
-        sys.exit(1)
+        # n_jobs=1 is preferred inside a loop or optuna worker to avoid overhead
+        db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=1).fit(X)
+        pred_labels = db.labels_
+    except Exception:
+        return 0.0
 
-    all_image_files = sorted(glob.glob(os.path.join(CAM_DIR, "*.png")))
-    if not all_image_files:
-        print("Error: No images found.")
-        sys.exit(1)
+    mask_valid_gt = gt_ids != 0
+    mask_clustered = pred_labels != -1
+    final_mask = mask_valid_gt | mask_clustered
 
-    cached_frames = []
-    limit = len(all_image_files) if max_frames_to_load is None else min(len(all_image_files), max_frames_to_load)
+    if np.sum(final_mask) == 0:
+        return 0.0
 
-    for frame_count in tqdm(range(1, limit), desc="Solving Velocities"):
-        image_path_B = all_image_files[frame_count]
-        frame_id_B = os.path.basename(image_path_B).split('.')[0]
-        pose_file = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
-        ply_file = os.path.join(PLY_DIR, f"{frame_id_B}.ply")
-        flow_file = os.path.join(FLOW_DIR, f"{frame_id_B}.npy")
+    y_true = gt_ids[final_mask]
+    y_pred = pred_labels[final_mask]
 
-        if not (os.path.exists(pose_file) and os.path.exists(ply_file) and os.path.exists(flow_file)):
-            continue
+    if len(y_true) == 0:
+        return 0.0
 
-        T_A_to_B = np.loadtxt(pose_file)
-        radar_detections = load_radar_ply(ply_file)
-        flow = np.load(flow_file)
+    _, _, v_meas = homogeneity_completeness_v_measure(y_true, y_pred)
+    return float(v_meas)
 
-        if not radar_detections:
-            continue
+# --- Optuna Objective ---
+def objective(trial):
+    global _shared_frames_data, _shared_frames_gt
 
-        frame_detections = estimate_velocities_from_data(
-            radar_detections, flow, mock_camera, 
-            T_A_to_B, T_A_to_R_static, DELTA_T
-        )
+    # --- CHANGE 1: Fine-Tuning Ranges ---
+    # Centered around your best results: eps=10.6, min_samples=20, vel=14.1
+    eps = trial.suggest_float("eps", 0.1, 13.0) 
+    min_samples = trial.suggest_int("min_samples", 6, 30)
+    velocity_weight = trial.suggest_float("velocity_weight", 0.1, 18.0)
+
+    scores = []
+    
+    # Loop through ALL loaded frames
+    for i in range(len(_shared_frames_data)):
+        frame_data = _shared_frames_data[i]
+        frame_gt = _shared_frames_gt[i]
         
-        if frame_detections:
-            cached_frames.append(frame_detections)
+        try:
+            # Fixed variable name bug here (was vel_weight)
+            score = evaluate_single_frame(frame_data, frame_gt, eps, min_samples, velocity_weight)
+            scores.append(score)
+        except Exception:
+            scores.append(0.0)
 
-    print(f"Successfully cached {len(cached_frames)} frames with valid data.")
+    if not scores:
+        return 0.0
+    
+    return np.mean(scores)
+
+# --- Data Preparation ---
+def prepare_data_lists(frames: List[Any]):
+    print("Pre-processing frames into numpy arrays...")
+    
+    frames_data = []
+    frames_gt = []
+
+    all_points = [p for f in frames for p in f]
+    obj_counts = defaultdict(int)
+    for p in all_points:
+        if p[7] > 0: obj_counts[p[7]] += 1
+    
+    # Valid IDs must appear in at least 10 points across the dataset
+    valid_ids = {oid for oid, c in obj_counts.items() if c >= 10}
+
+    for frame in frames:
+        if not frame:
+            continue
+            
+        # N x 6 Matrix (x, y, z, vx, vy, vz)
+        d_mat = np.array([np.concatenate([p[4], p[5]]) for p in frame], dtype=np.float32)
+        
+        # Ground Truth Array
+        gt_arr = np.array([p[7] if p[7] in valid_ids else 0 for p in frame], dtype=np.int32)
+        
+        frames_data.append(d_mat)
+        frames_gt.append(gt_arr)
+        
+    return frames_data, frames_gt
+
+# --- Main Optimization Routine ---
+def run_optimization(data: List[Any], n_trials: int = 50) -> None:
+    global _shared_frames_data, _shared_frames_gt
+    
+    # --- CHANGE 2: Removed Slicing/Chunking ---
+    print(f"Loading ALL {len(data)} frames into memory for optimization...")
+    _shared_frames_data, _shared_frames_gt = prepare_data_lists(data)
+    
+    print(f"Data ready. Dimensions: {len(_shared_frames_data)} frames.")
+    gc.collect()
+
+    # --- Run Optuna ---
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="maximize")
+    
+    print(f"Starting {n_trials} trials on FULL dataset...")
+    # Consider reducing n_trials slightly if dataset is huge, as it will be slower now
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    if len(study.trials) == 0:
+        print("Optimization failed.")
+        return
+
+    # --- Results ---
+    best = study.best_params
+    print("\n" + "="*40)
+    print("OPTIMIZATION COMPLETE")
+    print("="*40)
+    print(f"Best Mean V-Measure: {study.best_value:.4f}")
+    print("Optimal Parameters:")
+    print(f"  EPS:             {best['eps']:.4f}")
+    print(f"  Min Samples:     {best['min_samples']}")
+    print(f"  Velocity Weight: {best['velocity_weight']:.4f}")
+
+# --- Standard Boilerplate ---
+def load_data(max_frames: Optional[int] = None) -> List[Any]:
+    print("--- Phase 1: Loading Data ---")
+    carla_output_dir = "../carla/output"
+    delta_t = 0.05
+    cam_dir = os.path.join(carla_output_dir, "camera_rgb")
+    ply_dir = os.path.join(carla_output_dir, "radar_ply")
+    poses_dir = os.path.join(carla_output_dir, "poses")
+    calib_dir = os.path.join(carla_output_dir, "calib")
+    flow_dir = os.path.join(carla_output_dir, "flow")
+
+    try:
+        k_cam = np.loadtxt(os.path.join(calib_dir, "intrinsics.txt"))
+        t_a_to_r = np.loadtxt(os.path.join(calib_dir, "extrinsics_radar_from_camera.txt"))
+        mock_camera = MockCamera(k_cam)
+    except Exception as e:
+        print(f"Error loading calibration: {e}")
+        sys.exit(1)
+
+    image_files = sorted(glob.glob(os.path.join(cam_dir, "*.png")))
+    cached_frames = []
+    limit = len(image_files) if max_frames is None else min(len(image_files), max_frames)
+
+    for i in tqdm(range(1, limit), desc="Loading Frames"):
+        img_path = image_files[i]
+        frame_id = os.path.basename(img_path).split('.')[0]
+        pose_path = os.path.join(poses_dir, f"{frame_id}_relative_pose.txt")
+        ply_path = os.path.join(ply_dir, f"{frame_id}.ply")
+        flow_path = os.path.join(flow_dir, f"{frame_id}.npy")
+
+        if not (os.path.exists(pose_path) and os.path.exists(ply_path) and os.path.exists(flow_path)):
+            continue
+        try:
+            t_a_to_b = np.loadtxt(pose_path)
+            detections = load_radar_ply(ply_path)
+            flow = np.load(flow_path)
+            if not detections: continue
+
+            processed_frame = estimate_velocities_from_data(
+                detections, flow, mock_camera, t_a_to_b, t_a_to_r, delta_t
+            )
+            if processed_frame:
+                filtered_static_frame = filter_static_points(processed_frame) 
+                cached_frames.append(filtered_static_frame)
+        except: continue
+
+    
     return cached_frames
 
-def evaluate_clustering_quality(all_frames_data, eps, min_samples, weight_vz, weight_vxy):
-    """
-    Evaluates clustering Quality, ignoring objects with < 10 real points.
-    """
-    total_clusters_generated = 0
-    total_healthy_clusters = 0
-    
-    total_objects_tracked = 0
-    total_perfect_matches = 0   
-    
-    for frame_detections in all_frames_data:
-        
-        # --- PRE-SCAN: Identify Sparse Objects ---
-        real_point_counts = defaultdict(int)
-        for det in frame_detections:
-            if det[7] > 0 and det[3] == NoiseType.REAL:
-                real_point_counts[det[7]] += 1
-        
-        # Set of IDs that are "Worth Tracking"
-        valid_eval_ids = set()
-        for obj_id, count in real_point_counts.items():
-            if count >= 10:
-                valid_eval_ids.add(obj_id)
-                
-        # --- 1. Run Clustering ---
-        clusters, noise_points = cluster_detections_anisotropic(
-            detections=frame_detections,
-            eps=eps,
-            min_samples=min_samples,
-            weight_vz=weight_vz,
-            weight_vxy=weight_vxy
-        )
-        
-        total_clusters_generated += len(clusters)
-
-        # --- 2. Analyze Each Cluster ---
-        id_to_healthy_clusters = defaultdict(list)
-        
-        for c_idx, cluster in enumerate(clusters):
-            
-            # Tally Composition
-            id_counts = defaultdict(int)
-            count_actor_points = 0
-            count_wall_points = 0
-            count_noise_points = 0
-            
-            total_points = len(cluster)
-            
-            for det in cluster:
-                obj_id = det[7]
-                n_type = det[3]
-                
-                if obj_id > 0:
-                    id_counts[obj_id] += 1
-                    count_actor_points += 1
-                else:
-                    if n_type == NoiseType.REAL:
-                        count_wall_points += 1
-                    else:
-                        count_noise_points += 1
-            
-            # --- CLASSIFY THE CLUSTER ---
-            max_category = max(count_actor_points, count_wall_points, count_noise_points)
-            
-            if max_category == count_wall_points:
-                # WALL -> Neutral
-                total_clusters_generated -= 1
-                continue
-                
-            elif max_category == count_noise_points:
-                # GHOST -> Bad (Lowers Precision)
-                continue
-                
-            else:
-                # ACTOR CLUSTER
-                dominant_id = max(id_counts, key=id_counts.get)
-                
-                # CHECK: Is this a "Sparse Object"?
-                if dominant_id not in valid_eval_ids:
-                    # This cluster belongs to a far-away object we are ignoring.
-                    # Treat as Neutral (remove from denominator).
-                    total_clusters_generated -= 1
-                    continue
-                
-                # It is a Valid Target Object. Check Purity.
-                valid_signal_count = id_counts[dominant_id]
-                
-                if valid_signal_count > (total_points / 2):
-                    total_healthy_clusters += 1
-                    id_to_healthy_clusters[dominant_id].append(c_idx)
-
-        # --- 3. Analyze Objects (Recall) ---
-        # Only iterate over VALID IDs (>= 10 points)
-        for obj_id in valid_eval_ids:
-            total_objects_tracked += 1
-            assigned_healthy = id_to_healthy_clusters[obj_id]
-            
-            if len(assigned_healthy) == 1:
-                total_perfect_matches += 1
-
-    # --- C. Calculate Normalized Score ---
-    if total_clusters_generated == 0:
-        precision = 0.0
-    else:
-        precision = total_healthy_clusters / total_clusters_generated
-        
-    if total_objects_tracked == 0:
-        recall = 0.0
-    else:
-        recall = total_perfect_matches / total_objects_tracked
-        
-    if (precision + recall) > 0:
-        f1_score = 2 * (precision * recall) / (precision + recall)
-    else:
-        f1_score = 0.0
-    
-    return f1_score, total_perfect_matches, total_objects_tracked
-
-# --- 3. Main Execution ---
 if __name__ == "__main__":
-    
-    cached_data = cache_simulation_data(max_frames_to_load=None) 
-    
-    if not cached_data:
-        print("No data to optimize.")
+    # Removed max_frames limit to ensure we get everything available on disk
+    all_data = load_data(max_frames=None)
+    if not all_data:
         sys.exit(1)
-
-    keys, values = zip(*PARAM_GRID.items())
-    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
     
-    print(f"\n--- Phase 2: Grid Search ({len(param_combinations)} combinations) ---")
-
-    best_score = -1.0
-    best_params = None
-
-    for params in tqdm(param_combinations, desc="Optimizing"):
-        
-        score, matches, total = evaluate_clustering_quality(
-            cached_data, 
-            params['eps'], 
-            params['min_samples'], 
-            params['weight_vz'],
-            params['weight_vxy']
-        )
-        
-        if score > best_score:
-            best_score = score
-            best_params = params
-            print(f"New Best: {score:.3f} (Matches: {matches}/{total}) | Params: {params}")
-
-    print("\n" + "="*40)
-    print("OPTIMIZATION RESULTS")
-    print("="*40)
-    print(f"Best Integrity Score: {best_score*100:.2f}%")
-    print("-" * 20)
-    print("Optimal Parameters:")
-    print(f"  eps:             {best_params['eps']}")
-    print(f"  min_samples:     {best_params['min_samples']}")
-    print(f"  weight_vz:       {best_params['weight_vz']}")
-    print(f"  weight_vxy:      {best_params['weight_vxy']}")
-    print("="*40)
+    # Run optimization
+    run_optimization(all_data, n_trials=50)

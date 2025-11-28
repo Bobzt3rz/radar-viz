@@ -1,3 +1,5 @@
 python generate_flow.py ../carla/output/camera_rgb ../carla/output/flow
 
 python generate_flow.py ../carla/output/camera_rgb ../carla/output/flow_cv cv
+
+ffmpeg -framerate 20 -i frame_%08d_proj.png -c:v libopenh264 -b:v 10M -maxrate 10M -profile:v high -pix_fmt yuv420p a.mp4

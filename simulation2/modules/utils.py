@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple
 import cv2
+import textwrap
 from scipy.spatial import KDTree
 
 from .types import DetectionTuple, NoiseType
@@ -299,6 +300,7 @@ def save_clustering_analysis_plot(
     """
     Saves a 2x3 analysis plot showing clustering performance. 
     Metrics (TP, FP, F1) and error visualizations (TP/FP/FN/TN) are calculated internally.
+    Plot 5 specifically filters out Object ID 0.
     """
     
     # --- 1. Data Reconstruction and Metric Calculation ---
@@ -322,46 +324,38 @@ def save_clustering_analysis_plot(
                 tp_points.append(det) # True Positive (Real and Clustered)
             else:
                 fn_points.append(det) # False Negative (Real and Filtered)
-                
-        elif det[3] == NoiseType.MULTIPATH_GHOST:
-            gt_multipath += 1
-            if is_clustered:
-                fp_points.append(det) # False Positive (Noise and Clustered)
-            else:
-                tn_points.append(det) # True Negative (Noise and Filtered)
-                
+
         elif det[3] == NoiseType.RANDOM_CLUTTER:
             gt_random += 1
             if is_clustered:
                 fp_points.append(det) # False Positive (Noise and Clustered)
             else:
                 tn_points.append(det) # True Negative (Noise and Filtered)
+                
+        else:
+            gt_multipath += 1
+            if is_clustered:
+                fp_points.append(det) # False Positive (Noise and Clustered)
+            else:
+                tn_points.append(det) # True Negative (Noise and Filtered)
+                
+        
             
     # Final counts
     tp, fn = len(tp_points), len(fn_points)
     total_fp, total_tn = len(fp_points), len(tn_points)
     total_real_points = gt_real
     
-    # Count breakdown for FP/TN Bar Chart
-    fp_rand = sum(1 for det in fp_points if det[3] == NoiseType.RANDOM_CLUTTER)
-    fp_mp = total_fp - fp_rand
-    tn_rand = sum(1 for det in tn_points if det[3] == NoiseType.RANDOM_CLUTTER)
-    tn_mp = total_tn - tn_rand
-    
     # d. Calculate final scores
     precision = tp / (tp + total_fp) if (tp + total_fp) > 0 else 0.0
     recall = tp / total_real_points if total_real_points > 0 else 0.0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    # Prepare dictionaries for plotting
-    fp_dict = {'random': fp_rand, 'mp': fp_mp}
-    tn_dict = {'random': tn_rand, 'mp': tn_mp}
-
     # --- 2. Data Extraction for Plots ---
     
     real_pos = [det[4] for det in all_detections if det[3] == NoiseType.REAL]
     random_pos = [det[4] for det in all_detections if det[3] == NoiseType.RANDOM_CLUTTER]
-    mp_pos = [det[4] for det in all_detections if det[3] == NoiseType.MULTIPATH_GHOST]
+    mp_pos = [det[4] for det in all_detections if det[3] is not NoiseType.REAL and det[3] is not NoiseType.RANDOM_CLUTTER]
     all_points_pos = [det[4] for det in all_detections] # For axis limits
 
     # --- 3. Plotting Setup (2x3 Grid) ---
@@ -448,28 +442,32 @@ def save_clustering_analysis_plot(
     set_3d_limits(ax3)
     ax3.legend(fontsize=8)
 
-    # === PLOT 4: Detection Counts (Bar Chart) ===
+    # === PLOT 4: Overall Detection Counts (Bar Chart) ===
     ax4 = axes[1, 0]
-    count_labels = ['True Pos (TP)', 'False Pos (FP)', 'False Neg (FN)', 'True Neg (TN)']
+    count_labels = ['TP', 'FP', 'FN', 'TN']
     count_values = [tp, total_fp, fn, total_tn]
     colors = ['#4CAF50', '#F44336', '#FF9800', '#9E9E9E']
     bars = ax4.bar(count_labels, count_values, color=colors)
     ax4.bar_label(bars); ax4.set_title("4. Overall Detection Counts"); ax4.set_ylabel("Number of Points")
 
-    # === PLOT 5: FP/TN Breakdown (Bar Chart) ===
+    # === PLOT 5: Detection Counts (Excluding Object ID 0) ===
     ax5 = axes[1, 1]
-    noise_labels = ['Random', 'Multipath']
-    fp_values = [fp_dict.get('random', 0), fp_dict.get('mp', 0)]
-    tn_values = [tn_dict.get('random', 0), tn_dict.get('mp', 0)]
-    bar_width = 0.35; index = np.arange(len(noise_labels))
-    bars1 = ax5.bar(index - bar_width/2, fp_values, bar_width, label='False Pos (Clustered)', color='#F44336')
-    bars2 = ax5.bar(index + bar_width/2, tn_values, bar_width, label='True Neg (Filtered)', color='#9E9E9E')
-    ax5.bar_label(bars1); ax5.bar_label(bars2); ax5.set_title('5. Noise Filter Performance Breakdown')
-    ax5.set_ylabel('Number of Points'); ax5.set_xticks(index); ax5.set_xticklabels(noise_labels)
-    ax5.legend(fontsize=8)
+    
+    # Filter detections where det[7] (Object ID) is NOT 0
+    tp_no0 = sum(1 for det in tp_points if det[7] != 0)
+    fp_no0 = sum(1 for det in fp_points if det[7] != 0)
+    fn_no0 = sum(1 for det in fn_points if det[7] != 0)
+    tn_no0 = sum(1 for det in tn_points if det[7] != 0)
+
+    count_labels_no0 = ['TP (No 0)', 'FP (No 0)', 'FN (No 0)', 'TN (No 0)']
+    count_values_no0 = [tp_no0, fp_no0, fn_no0, tn_no0]
+    
+    bars5 = ax5.bar(count_labels_no0, count_values_no0, color=colors)
+    ax5.bar_label(bars5)
+    ax5.set_title("5. Detection Counts (Ignoring ID 0)")
+    ax5.set_ylabel("Number of Points")
     
     # === PLOT 6: Placeholder (empty in 2x3) ===
-    # Axes[1, 2] is not used in the 2x3 layout since the 3D plots are added separately.
     axes[1, 2].axis('off')
 
     # --- 4. Save and Close ---
@@ -502,8 +500,8 @@ def draw_points_by_noise(
     
     # Define colors (BGR format for OpenCV)
     COLOR_REAL = (0, 255, 0)   # Green
-    COLOR_MULTIPATH = (0, 0, 255)  # Red
-    COLOR_RANDOM = (0, 0, 0)
+    COLOR_MULTIPATH = (0, 0, 0)  # Black
+    COLOR_RANDOM = (0, 0, 255)
 
     # Filter detections to only include the points that were successfully projected (valid_mask)
     valid_detections = [det for det, is_valid in zip(detections, valid_mask) if is_valid]
@@ -524,7 +522,7 @@ def draw_points_by_noise(
         color = COLOR_REAL if noiseType == NoiseType.REAL else COLOR_MULTIPATH if noiseType == NoiseType.MULTIPATH_GHOST else COLOR_RANDOM
             
         if 0 <= u < w and 0 <= v < h:
-            cv2.circle(img_with_points, (int(u), int(v)), 2, color, -1)
+            cv2.circle(img_with_points, (int(u), int(v)), 3, color, -1)
             
     return img_with_points
 
@@ -584,221 +582,388 @@ def project_and_get_depths(
     
     return points_2d, depths_valid, valid_mask # <-- RETURNING MASK
 
-def save_frame_histogram_by_object(
+class GlobalErrorTracker:
+    def __init__(self):
+        # Structure: [NoiseType][Axis_Index (0-3)] -> List of errors
+        self.noise_errors = {
+            'ShiftX': [[], [], [], []],
+            'ShiftY': [[], [], [], []],
+            'ShiftZ': [[], [], [], []],
+            'Radial': [[], [], [], []],
+            # We omit 'Random' here if we only care about Actor noise models in the summary
+        }
+        # We will only store "Real" errors for Actors (Obj ID > 0)
+        self.actor_real_errors = [[], [], [], []] # [Vx, Vy, Vz, Mag]
+
+    def add_data(self, noise_map, real_vel_np, gt_vel_radar, object_id):
+        """
+        Accumulates error data. 
+        CRITICAL FIX: Only adds 'Real' data if object_id > 0 (Actors).
+        """
+        gt_mag = np.linalg.norm(gt_vel_radar)
+        
+        # 1. Store Real Errors (STRICTLY FOR ACTORS)
+        if object_id > 0:
+            for axis in range(3):
+                if len(real_vel_np) > 0:
+                    errs = np.abs(real_vel_np[:, axis] - gt_vel_radar[axis])
+                    self.actor_real_errors[axis].extend(errs)
+            if len(real_vel_np) > 0:
+                mag_errs = np.abs(np.linalg.norm(real_vel_np, axis=1) - gt_mag)
+                self.actor_real_errors[3].extend(mag_errs)
+
+        # 2. Store Noise Errors (These are already implicitly Actor-only)
+        for name, data in noise_map.items():
+            if name not in self.noise_errors: continue
+            
+            for axis in range(3):
+                if len(data) > 0:
+                    errs = np.abs(data[:, axis] - gt_vel_radar[axis])
+                    self.noise_errors[name][axis].extend(errs)
+            if len(data) > 0:
+                mag_errs = np.abs(np.linalg.norm(data, axis=1) - gt_mag)
+                self.noise_errors[name][3].extend(mag_errs)
+
+def save_frame_projections(frame_number: int,
+                           detections: List[DetectionTuple],
+                           image_rgb: np.ndarray,
+                           T_Cam_from_Radar: np.ndarray,
+                           K: np.ndarray,
+                           output_dir: str = "output/frame_projections"):
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        image_bgr_to_draw = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+        non_static_detections = [d for d in detections if d[7] != 0]
+        
+        points_2d, _, full_object_mask = project_and_get_depths(non_static_detections, T_Cam_from_Radar, K)
+        
+        image_with_points = draw_points_by_noise(image_bgr_to_draw, non_static_detections, points_2d, full_object_mask)
+        
+        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_number:08d}_proj.png"), image_with_points)
+    except Exception as e:
+        # print(f"Projection failed for frame {frame_number}, obj {object_id}: {e}")
+        pass
+
+def save_frame_error_histogram(
     frame_number: int,
-    all_frame_detections: List[DetectionTuple],
+    all_frame_detections: List[Tuple], 
     image_rgb: np.ndarray,                    
-    T_Cam_from_Radar: np.ndarray,       # Extrinsics (T_C_R)
-    K: np.ndarray,                      # Intrinsics (K)
+    T_Cam_from_Radar: np.ndarray,       
+    K: np.ndarray,                      
     output_dir: str = "output/object_analysis"
 ):
     """
-    Groups detections, calculates metrics, and saves a 3x3 statistical analysis plot.
+    Plots Absolute Error (|Pred - GT|) with Global Isotropic Scaling.
     
-    Logic Update:
-    - Object ID 0: Plots 'Real' vs 'Random Noise' (Purple).
-    - Other IDs:   Plots 'Real' vs 'Multipath' (Red).
-    
-    Grid Layout:
-    [Vx]   [Vy]   [Vz]
-    [Vxy]  [Vyz]  [Vxz]
-    [Vxyz] [Pos3D][Vel3D]
+    RETURNS:
+        frame_data_list (List): A list where each item is tuple:
+        (noise_map, real_vel_np, gt_vel_radar)
+        You can iterate this list to update your GlobalErrorTracker.
     """
     
-    # 1. Group all detections by object_id
-    grouped_detections: Dict[int, List[DetectionTuple]] = {}
-    for det in all_frame_detections:
-        object_id = det[7]
-        if object_id not in grouped_detections:
-            grouped_detections[object_id] = []
-        grouped_detections[object_id].append(det)
+    # Return container
+    frame_data_collection = []
 
-    # Pre-filter random noise
+    # 1. Group detections
+    grouped_detections: Dict[int, List[Tuple]] = {}
+    for det in all_frame_detections:
+        obj = det[7]
+        if obj not in grouped_detections: grouped_detections[obj] = []
+        grouped_detections[obj].append(det)
+
     random_noise_detections = [det for det in all_frame_detections if det[3] == NoiseType.RANDOM_CLUTTER]
     
-    # 2. Iterate and process each object
+    VEL_COLS = [(0, "Err Vx"), 
+                (1, "Err Vy"), 
+                (2, "Err Vz"), 
+                (None, "Err |V|"), 
+                ('max_comp', "Max(Err X,Y,Z)")
+            ]
+
+    # --- ITERATE THROUGH ALL OBJECTS ---
     for object_id, detections in grouped_detections.items():
         
-        # --- 2.1 Extract Data based on Object ID ---
-        real_positions, real_velocities = [], []
-        comp_positions, comp_velocities = [], [] # "Comparison" data (either Multipath or Random)
-        
-        # Labels and Colors configuration
-        comp_label_name = ""
-        comp_color = ""
-
-        # Ground Truth (Assumed to be in the first detection of the group)
-        gt_vel_radar = detections[0][5]
-
-        # Extract REAL data for this object
-        for det in detections:
-            if det[3] == NoiseType.REAL:
-                real_positions.append(det[4])
-                real_velocities.append(det[5])
-
-        # Extract COMPARISON data (Branching Logic)
-        if object_id == 0:
-            # Case: Object 0 -> Compare against RANDOM NOISE
-            comp_label_name = "Random"
-            comp_color = "purple"
-            
-            for det in random_noise_detections:
-                comp_positions.append(det[4])
-                comp_velocities.append(det[5])
-        else:
-            # Case: Other Objects -> Compare against MULTIPATH
-            comp_label_name = "Multi"
-            comp_color = "red"
-            
-            for det in detections:
-                if det[3] == NoiseType.MULTIPATH_GHOST:
-                    comp_positions.append(det[4])
-                    comp_velocities.append(det[5])
-
-        # Convert to numpy
-        real_pos_np = np.array(real_positions) if real_positions else np.empty((0, 3))
-        real_vel_np = np.array(real_velocities) if real_velocities else np.empty((0, 3))
-        
-        comp_pos_np = np.array(comp_positions) if comp_positions else np.empty((0, 3))
-        comp_vel_np = np.array(comp_velocities) if comp_velocities else np.empty((0, 3))
-
-        # --- 2.2 Calculate Scales (Global Limits) ---
-        
-        # A. Global Component Limits (Row 1: Vx, Vy, Vz)
-        all_vel_values = []
-        if real_vel_np.size > 0: all_vel_values.append(real_vel_np.flatten())
-        if comp_vel_np.size > 0: all_vel_values.append(comp_vel_np.flatten())
-        all_vel_values.append(gt_vel_radar)
-        
-        combined_vel = np.concatenate(all_vel_values)
-        v_min, v_max = np.min(combined_vel), np.max(combined_vel)
-        
-        v_range = v_max - v_min
-        if v_range == 0: v_range = 1.0
-        global_v_min = v_min - (v_range * 0.1)
-        global_v_max = v_max + (v_range * 0.1)
-        
-        shared_bins_comp = np.linspace(global_v_min, global_v_max, 30)
-
-        # B. Global Magnitude Limits (Rows 2 & 3: Vxy, Vyz, Vxz, Vxyz)
-        max_mag = 0.0
-        if real_vel_np.size > 0:
-            max_mag = max(max_mag, np.max(np.linalg.norm(real_vel_np, axis=1)))
-        if comp_vel_np.size > 0:
-            max_mag = max(max_mag, np.max(np.linalg.norm(comp_vel_np, axis=1)))
-        max_mag = max(max_mag, np.linalg.norm(gt_vel_radar))
-
-        global_mag_max = max_mag * 1.1
-        shared_bins_mag = np.linspace(0, global_mag_max, 30)
-
-        # --- 2.3 Setup Directories ---
         object_output_dir = os.path.join(output_dir, f"object_{object_id:04d}")
         os.makedirs(object_output_dir, exist_ok=True)
-        
-        header_text = (
-            f"Counts: Real={len(real_positions)} | {comp_label_name}={len(comp_positions)}\n"
-            f"GT Velocity: ({gt_vel_radar[0]:.2f}, {gt_vel_radar[1]:.2f}, {gt_vel_radar[2]:.2f})"
-        )
-        
-        # --- 2.4 Generate Image Projection ---
+
+        # --- PART A: PROJECTION LOGIC (PRESERVED) ---
         try:
             image_bgr_to_draw = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-
-            # RULE: Only include random noise points if object_id is 0
-            if object_id == 0:
-                detections_for_projection = detections + random_noise_detections
-            else:
-                detections_for_projection = detections
-
-            points_2d, _, full_object_mask = project_and_get_depths(
-                detections_for_projection, T_Cam_from_Radar, K
-            )
+            # Include random noise only for background (Obj 0), otherwise just object points
+            dets_to_draw = detections + random_noise_detections if object_id == 0 else detections
             
-            image_with_points = draw_points_by_noise(
-                image_bgr_to_draw, detections_for_projection, points_2d, full_object_mask
-            )
-
-            image_save_path = os.path.join(object_output_dir, f"frame_{frame_number:08d}_projection.png")
-            cv2.imwrite(image_save_path, image_with_points)
+            # (Assuming project_and_get_depths is available in your scope)
+            points_2d, _, full_object_mask = project_and_get_depths(dets_to_draw, T_Cam_from_Radar, K)
             
+            # (Assuming draw_points_by_noise is available in your scope)
+            image_with_points = draw_points_by_noise(image_bgr_to_draw, dets_to_draw, points_2d, full_object_mask)
+            
+            cv2.imwrite(os.path.join(object_output_dir, f"frame_{frame_number:08d}_proj.png"), image_with_points)
         except Exception as e:
-            print(f"Error generating projection image for obj {object_id}: {e}")
-        
+            # print(f"Projection failed for frame {frame_number}, obj {object_id}: {e}")
+            pass
 
-        # --- 2.5 Plotting (3x3 Grid) ---
-        plt.style.use('ggplot')
-        fig, axes = plt.subplots(3, 3, figsize=(26, 24)) 
-        
-        fig.suptitle(f'Frame {frame_number} - Object ID {object_id} Velocity Analysis ({comp_label_name} Mode)', fontsize=22, y=0.98) 
-        fig.text(
-            0.5, 0.94, header_text, 
-            ha='center', fontsize=14, family='monospace', 
-            bbox=dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.5')
-        )
+        # --- PART B: EXTRACT DATA ---
+        gt_vel_radar = detections[0][5]
+        gt_mag = np.linalg.norm(gt_vel_radar)
 
-        # Helper: Plot Component (Row 1)
-        def plot_comp(ax, real_d, comp_d, gt_v, title):
-            if real_d.size > 0:
-                ax.hist(real_d, bins=shared_bins_comp, color='blue', alpha=0.6, label=f'Real ($\sigma$={np.std(real_d):.2f})')
-            if comp_d.size > 0:
-                ax.hist(comp_d, bins=shared_bins_comp, color=comp_color, alpha=0.5, label=f'{comp_label_name} ($\sigma$={np.std(comp_d):.2f})')
-            ax.axvline(gt_v, color='green', ls='--', lw=3, label=f'GT: {gt_v:.2f}')
-            ax.set_title(title); ax.set_xlim(global_v_min, global_v_max); ax.legend(fontsize=9)
+        # Real Data
+        real_vels = [det[5] for det in detections if det[3] == NoiseType.REAL]
+        real_vel_np = np.array(real_vels) if real_vels else np.empty((0, 3))
 
-        # Helper: Plot Magnitude (Rows 2 & 3)
-        def plot_mag(ax, real_vec, comp_vec, gt_vec, idxs, title):
-            # Extract magnitude based on indices (e.g., [0,1] for xy)
-            r_mag = np.linalg.norm(real_vec[:, idxs], axis=1) if real_vec.size > 0 else np.array([])
-            c_mag = np.linalg.norm(comp_vec[:, idxs], axis=1) if comp_vec.size > 0 else np.array([])
-            gt_mag = np.linalg.norm(gt_vec[idxs])
+        # Noise Map Construction
+        if object_id == 0:
+            noise_map = {'Random': np.array([d[5] for d in random_noise_detections]) if random_noise_detections else np.empty((0,3))}
+            row_configs = [('Random', 'purple')]
+        else:
+            temp_noise = {nt: [] for nt in [NoiseType.SHIFTX, NoiseType.SHIFTY, NoiseType.SHIFTZ, NoiseType.SHIFTRADIAL]}
+            for det in detections:
+                if det[3] in temp_noise: temp_noise[det[3]].append(det[5])
             
-            if r_mag.size > 0:
-                ax.hist(r_mag, bins=shared_bins_mag, color='blue', alpha=0.6, label=f'Real ($\sigma$={np.std(r_mag):.2f})')
-            if c_mag.size > 0:
-                ax.hist(c_mag, bins=shared_bins_mag, color=comp_color, alpha=0.5, label=f'{comp_label_name} ($\sigma$={np.std(c_mag):.2f})')
-            ax.axvline(gt_mag, color='green', ls='--', lw=3, label=f'GT: {gt_mag:.2f}')
-            ax.set_title(title); ax.set_xlim(0, global_mag_max); ax.legend(fontsize=9)
+            noise_map = {
+                'ShiftX': np.array(temp_noise[NoiseType.SHIFTX]) if temp_noise[NoiseType.SHIFTX] else np.empty((0,3)),
+                'ShiftY': np.array(temp_noise[NoiseType.SHIFTY]) if temp_noise[NoiseType.SHIFTY] else np.empty((0,3)),
+                'ShiftZ': np.array(temp_noise[NoiseType.SHIFTZ]) if temp_noise[NoiseType.SHIFTZ] else np.empty((0,3)),
+                'Radial': np.array(temp_noise[NoiseType.SHIFTRADIAL]) if temp_noise[NoiseType.SHIFTRADIAL] else np.empty((0,3)),
+            }
+            row_configs = [
+                ('ShiftX', 'orange'), ('ShiftY', 'cyan'), ('ShiftZ', 'gold'), ('Radial', 'lime')
+            ]
 
-        # === ROW 1: COMPONENTS (Vx, Vy, Vz) ===
-        plot_comp(axes[0,0], real_vel_np[:,0] if real_vel_np.size else np.array([]), comp_vel_np[:,0] if comp_vel_np.size else np.array([]), gt_vel_radar[0], "Vx (m/s)")
-        plot_comp(axes[0,1], real_vel_np[:,1] if real_vel_np.size else np.array([]), comp_vel_np[:,1] if comp_vel_np.size else np.array([]), gt_vel_radar[1], "Vy (m/s)")
-        plot_comp(axes[0,2], real_vel_np[:,2] if real_vel_np.size else np.array([]), comp_vel_np[:,2] if comp_vel_np.size else np.array([]), gt_vel_radar[2], "Vz (m/s)")
+        # --- SAVE DATA FOR GLOBAL TRACKER ---
+        # We append this tuple to our list, to be returned AFTER the loop
+        frame_data_collection.append((noise_map, real_vel_np, gt_vel_radar, object_id))
 
-        # === ROW 2: 2D MAGNITUDES (Vxy, Vyz, Vxz) ===
-        # Vxy (Indices 0, 1)
-        plot_mag(axes[1,0], real_vel_np, comp_vel_np, gt_vel_radar, [0, 1], "Horizontal Speed ($|V_{xy}|$)")
-        # Vyz (Indices 1, 2)
-        plot_mag(axes[1,1], real_vel_np, comp_vel_np, gt_vel_radar, [1, 2], "Side Profile Speed ($|V_{yz}|$)")
-        # Vxz (Indices 0, 2)
-        plot_mag(axes[1,2], real_vel_np, comp_vel_np, gt_vel_radar, [0, 2], "Front Profile Speed ($|V_{xz}|$)")
-
-        # === ROW 3: TOTAL MAGNITUDE & 3D CLUSTERS ===
+        # --- PART C: CALCULATE LIMITS (Global Error Scaling) ---
+        max_errors = []
         
-        # 3.1 Total Speed (Indices 0,1,2)
-        plot_mag(axes[2,0], real_vel_np, comp_vel_np, gt_vel_radar, [0, 1, 2], "Total Speed ($|V_{xyz}|$)")
+        # Helper to get error array
+        def get_errs(arr, ax_idx):
+            if len(arr) == 0: return np.array([])
+            
+            if ax_idx == 'max_comp':
+                # Calculate Abs Error for ALL 3 axes, then take the Max per point
+                # arr shape: (N, 3), gt_vel_radar shape: (3,)
+                diffs = np.abs(arr - gt_vel_radar)
+                return np.max(diffs, axis=1) # Returns shape (N,)
+            
+            elif ax_idx is None:
+                # Magnitude error
+                val = np.linalg.norm(arr, axis=1)
+                gt = gt_mag
+                return np.abs(val - gt)
+            
+            else:
+                # Single Axis error
+                val = arr[:, ax_idx] 
+                gt = gt_vel_radar[ax_idx]
+                return np.abs(val - gt)
 
-        # 3.2 3D Position
-        axes[2,1].remove(); ax_pos = fig.add_subplot(3, 3, 8, projection='3d')
-        if real_pos_np.size: ax_pos.scatter(real_pos_np[:,0], real_pos_np[:,1], real_pos_np[:,2], c='b', s=15, alpha=0.6, label='Real')
-        if comp_pos_np.size: ax_pos.scatter(comp_pos_np[:,0], comp_pos_np[:,1], comp_pos_np[:,2], c=comp_color, s=15, alpha=0.4, label=comp_label_name)
-        ax_pos.set_title("3D Position"); ax_pos.set_xlabel("X"); ax_pos.set_ylabel("Y"); ax_pos.set_zlabel("Z"); ax_pos.legend()
+        # Scan columns for max error
+        for col_idx, (axis_idx, _) in enumerate(VEL_COLS):
+            col_max = 0
+            e_real = get_errs(real_vel_np, axis_idx)
+            if len(e_real): col_max = max(col_max, np.max(e_real))
+            for n_key in noise_map:
+                e_noise = get_errs(noise_map[n_key], axis_idx)
+                if len(e_noise): col_max = max(col_max, np.max(e_noise))
+            max_errors.append(col_max)
 
-        # 3.3 3D Velocity
-        axes[2,2].remove(); ax_vel = fig.add_subplot(3, 3, 9, projection='3d')
-        if real_vel_np.size: ax_vel.scatter(real_vel_np[:,0], real_vel_np[:,1], real_vel_np[:,2], c='b', s=15, alpha=0.6, label='Real')
-        if comp_vel_np.size: ax_vel.scatter(comp_vel_np[:,0], comp_vel_np[:,1], comp_vel_np[:,2], c=comp_color, s=15, alpha=0.4, label=comp_label_name)
-        ax_vel.scatter([gt_vel_radar[0]], [gt_vel_radar[1]], [gt_vel_radar[2]], c='g', s=100, marker='*', label='GT')
-        ax_vel.set_title("3D Velocity"); ax_vel.set_xlabel("Vx"); ax_vel.set_ylabel("Vy"); ax_vel.set_zlabel("Vz")
+        global_max_err = max(max_errors) if max_errors else 0
+        plot_limit = max(global_max_err * 1.1, 1.0) # Min 1.0m/s width
         
-        limit = max(5.0, np.max(np.abs(combined_vel)) * 1.1) if 'combined_vel' in locals() else 5.0
-        ax_vel.set_xlim([-limit, limit]); ax_vel.set_ylim([-limit, limit]); ax_vel.set_zlim([-limit, limit]); ax_vel.legend()
+        shared_bins = np.linspace(0, plot_limit, 50) 
 
-        # --- Save ---
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) 
-        save_path = os.path.join(object_output_dir, f"frame_{frame_number:08d}_analysis.png")
-        plt.savefig(save_path, dpi=100)
+        # --- PART D: PLOTTING ---
+        plt.style.use('ggplot')
+        rows = len(row_configs)
+        fig, axes = plt.subplots(rows, 5, figsize=(50, 4 * rows))
+        
+        title_prefix = "Background (Obj 0)" if object_id == 0 else f"Object {object_id}"
+        fig.suptitle(f'Frame {frame_number} - {title_prefix} - Absolute Error Analysis', fontsize=26)
+        
+        if rows == 1: axes = np.expand_dims(axes, axis=0)
+
+        for row_idx, (noise_label, noise_color) in enumerate(row_configs):
+            curr_noise_data = noise_map[noise_label]
+            
+            for col_idx, (axis_idx, col_label) in enumerate(VEL_COLS):
+                ax = axes[row_idx, col_idx]
+                
+                r_err = get_errs(real_vel_np, axis_idx)
+                n_err = get_errs(curr_noise_data, axis_idx)
+
+                if len(r_err) > 0:
+                    ax.hist(r_err, bins=shared_bins, color='blue', alpha=0.5, density=True, label=f'Real (N={len(r_err)})')
+                    ax.axvline(np.mean(r_err), color='darkblue', ls=':', lw=2, label=f'μ={np.mean(r_err):.2f}')
+                
+                if len(n_err) > 0:
+                    ax.hist(n_err, bins=shared_bins, color=noise_color, alpha=0.5, density=True, label=f'{noise_label} (N={len(n_err)})')
+                    ax.axvline(np.mean(n_err), color=noise_color, ls=':', lw=2, label=f'μ={np.mean(n_err):.2f}')
+
+                ax.axvline(0, color='green', ls='-', lw=3, label='GT (0)')
+                ax.set_xlim(0, plot_limit)
+                
+                if row_idx == 0: ax.set_title(col_label, fontsize=20, fontweight='bold')
+                if col_idx == 0: ax.set_ylabel(f"vs {noise_label}", fontsize=18, fontweight='bold')
+                ax.legend(fontsize=10, loc='upper right')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        plt.savefig(os.path.join(object_output_dir, f"frame_{frame_number:08d}_error_analysis.png"), dpi=150)
         plt.close(fig)
 
+    # --- RETURN DATA FOR ALL OBJECTS ---
+    return frame_data_collection
+
+def plot_global_summary(
+    clusters: List[List['DetectionTuple']], 
+    filtered_clusters: List[List['DetectionTuple']], 
+    cluster_noise: List['DetectionTuple'], 
+    filtered_cluster_noise: List['DetectionTuple'],  
+    output_dir: str = "output"
+):
+    """
+    Generates a 2x2 Global Summary Plot (Ablation Study).
+    Fixed to avoid hashing errors with numpy arrays.
+    
+    Layout:
+    1. Normal Clusters (All IDs)    | 2. Normal Clusters (ID > 0)
+    3. Filtered Clusters (All IDs)  | 4. Filtered Clusters (ID > 0)
+    """
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # --- Helper: Metric Calculation (Optimized) ---
+    def get_metrics(input_clusters, input_noise_flat, exclude_id_zero=False):
+        """
+        Calculates TP/FP/FN/TN by iterating lists directly.
+        Avoids set() lookups on unhashable numpy arrays.
+        """
+        tp, fp, fn, tn = 0, 0, 0, 0
+        real_gt_count = 0
+        
+        # 1. Analyze Clustered Points (Predicted = Positive)
+        # input_clusters is List[List[DetectionTuple]]
+        for cluster in input_clusters:
+            for det in cluster:
+                # Filter ID
+                if exclude_id_zero and det[7] == 0:
+                    continue
+                
+                # Check Ground Truth
+                if det[3] == NoiseType.REAL:
+                    tp += 1
+                    real_gt_count += 1
+                else:
+                    fp += 1 # Noise that got clustered
+
+        # 2. Analyze Noise Points (Predicted = Negative)
+        # input_noise_flat is List[DetectionTuple]
+        for det in input_noise_flat:
+            # Filter ID
+            if exclude_id_zero and det[7] == 0:
+                continue
+                
+            # Check Ground Truth
+            if det[3] == NoiseType.REAL:
+                fn += 1 # Real point that was discarded as noise
+                real_gt_count += 1
+            else:
+                tn += 1 # Noise point correctly discarded
+                    
+        # Stats Calculation
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / real_gt_count if real_gt_count > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        return {
+            'counts': [tp, fp, fn, tn],
+            'stats': (precision, recall, f1)
+        }
+
+    # --- Helper: Bar Plotter ---
+    def plot_bar_subplot(ax, title, data):
+        counts = data['counts'] # [TP, FP, FN, TN]
+        prec, rec, f1 = data['stats']
+        
+        labels = ['TP: Correctly Kept Real Points', 'FP: Incorrectly Filtered Real Points', 'FN: Incorrectly Kept Noise Points', 'TN: Correctly Filtered Noise Points']
+        colors = ['#4CAF50', '#F44336', '#FF9800', '#9E9E9E'] # Green, Red, Orange, Gray
+
+        labels = ['\n'.join(textwrap.wrap(l, width=12)) for l in labels]
+        
+        bars = ax.bar(labels, counts, color=colors)
+        ax.bar_label(bars, fmt='%d', padding=3)
+        
+        # Formatting
+        ax.set_title(title, fontsize=12, weight='bold')
+        ax.set_ylabel("Count")
+        ax.grid(axis='y', linestyle='--', alpha=0.5)
+        
+        # Add Stats Text Box
+        stats_text = (
+            f"Prec:   {prec*100:.1f}%\n"
+            f"Recall: {rec*100:.1f}%\n"
+            f"F1:     {f1*100:.1f}%"
+        )
+        ax.text(0.95, 0.95, stats_text, transform=ax.transAxes, 
+                fontsize=11, family='monospace', verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+    # --- 1. Prepare Data ---
+    
+    # Helper to flatten noise if it comes as List[List] (e.g. grouped by frame)
+    def ensure_flat(noise_input):
+        if noise_input and isinstance(noise_input[0], list):
+             return [item for sublist in noise_input for item in sublist]
+        return noise_input
+
+    flat_noise_normal = ensure_flat(cluster_noise)
+    flat_noise_filtered = ensure_flat(filtered_cluster_noise)
+
+    # 1. Normal - All IDs
+    res_norm_all = get_metrics(clusters, flat_noise_normal, exclude_id_zero=False)
+    # 2. Normal - ID > 0
+    res_norm_filter = get_metrics(clusters, flat_noise_normal, exclude_id_zero=True)
+    # 3. Filtered - All IDs
+    res_filt_all = get_metrics(filtered_clusters, flat_noise_filtered, exclude_id_zero=False)
+    # 4. Filtered - ID > 0
+    res_filt_filter = get_metrics(filtered_clusters, flat_noise_filtered, exclude_id_zero=True)
+
+    # --- 2. Plotting ---
+    
+    plt.style.use('ggplot')
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Global Clustering Performance Summary (Ablation Test)', fontsize=18, weight='bold', y=0.98)
+    
+    # Plot 1: Normal (All IDs)
+    plot_bar_subplot(axes[0, 0], "1. Normal Clustering (Score With Static Background Points)", res_norm_all)
+    
+    # Plot 2: Normal (ID > 0)
+    plot_bar_subplot(axes[0, 1], "2. Normal Clustering (Score Without Static Background Points)", res_norm_filter)
+    
+    # Plot 3: Filtered (All IDs)
+    plot_bar_subplot(axes[1, 0], "3. Filtered Clustering (Score With Static Background Points)", res_filt_all)
+    
+    # Plot 4: Filtered (ID > 0)
+    plot_bar_subplot(axes[1, 1], "4. Filtered Clustering (Score Without Static Background Points)", res_filt_filter)
+    
+    # Final Adjustments
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    save_path = os.path.join(output_dir, "global_summary_ablation_2.png")
+    # print(f"Saving global summary to: {save_path}") # Optional print
+    fig.savefig(save_path)
+    plt.close(fig)
+
+# TODO:
+# def print_noise_injection_summary(detections: List[DetectionTuple]):
+#     shifted_x_noise = [det for det in detections if det[3] == NoiseType.SHIFTX]
+#     for noise in shifted_x_noise:
+        
+
+    
 def save_cluster_survivor_analysis(
     frame_number: int,
     clusters: List[List[DetectionTuple]],

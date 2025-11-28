@@ -3,39 +3,48 @@ import os
 import glob
 import numpy as np
 import itertools
-from typing import List, Tuple
+import concurrent.futures
+from scipy import stats
+from typing import List, Tuple, Dict
 from tqdm import tqdm
+from collections import namedtuple
 
 # --- Imports ---
-# Ensure these match your project structure
-from modules.clustering import cluster_detections_anisotropic, filter_clusters_median
-from modules.types import NoiseType
+from modules.clustering import cluster_detections_6d, filter_clusters_quantile, filter_clusters_mad, filter_static_points
+from modules.types import NoiseType, DetectionTuple
 from main_carla import load_radar_ply, estimate_velocities_from_data, MockCamera
 
 # --- CONFIGURATION ---
 
-# 1. The Fixed "Optimal" Clustering Parameters (From your previous run)
+# 1. Fixed DBSCAN Params (The Baseline)
 FIXED_CLUSTERING_PARAMS = {
-    'eps': 1.5,
-    'min_samples': 8,
-    'weight_vz': 6,
-    'weight_vxy': 3
+    'eps': 8.7205,
+    'min_samples': 11,
+    'velocity_weight': 2.5279
 }
 
-# 2. The Search Grid for Filtering
+# 2. Search Grid for 3D Box Filter
+# We test different deep ratios for Lateral (X), Longitudinal (Y), and Vertical (Z)
 PARAM_GRID = {
-    # How far (m/s) a point can be from the median before being deleted.
-    # Testing strict (2.0) to loose (15.0) thresholds.
-    'purge_threshold': [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+    'x': [1.5, 2, 2.25, 2.5, 2.75, 3.0, 3.25],
+    'y': [1.5, 2, 2.25, 2.5, 2.75, 3.0, 3.25],
+    'z': [1, 1.25, 1.5, 1.75, 2, 2.5, 2.75, 3.0, 3.25]
 }
 
-# --- Data Loader (Same as before) ---
+# --- GLOBAL WORKER STATE ---
+# We store the pre-calculated raw clusters here to avoid pickling overhead
+_worker_raw_clusters = None
+
+def init_worker(data):
+    """Stores the raw clusters in the worker process memory."""
+    global _worker_raw_clusters
+    _worker_raw_clusters = data
+
+# --- Data Loader ---
 def cache_simulation_data(max_frames_to_load=None):
     print("--- Phase 1: Caching Simulation Data ---")
-    # ... (Identical logic to your previous script, omitted for brevity) ...
-    # You can copy-paste the cache_simulation_data function from your previous file here.
-    # For now, I will assume it's the exact same function.
     
+    # Path Setup
     CARLA_OUTPUT_DIR = "../carla/output"
     DELTA_T = 0.05
     CAM_DIR = os.path.join(CARLA_OUTPUT_DIR, "camera_rgb")
@@ -56,7 +65,8 @@ def cache_simulation_data(max_frames_to_load=None):
     cached_frames = []
     limit = len(all_image_files) if max_frames_to_load is None else min(len(all_image_files), max_frames_to_load)
 
-    for frame_count in tqdm(range(1, limit), desc="Solving Velocities"):
+    # Load Data Loop
+    for frame_count in tqdm(range(1, limit), desc="Loading & Solving"):
         image_path_B = all_image_files[frame_count]
         frame_id_B = os.path.basename(image_path_B).split('.')[0]
         pose_file = os.path.join(POSES_DIR, f"{frame_id_B}_relative_pose.txt")
@@ -76,62 +86,78 @@ def cache_simulation_data(max_frames_to_load=None):
             radar_detections, flow, mock_camera, 
             T_A_to_B, T_A_to_R_static, DELTA_T
         )
-        if frame_detections: cached_frames.append(frame_detections)
+        if frame_detections: 
+            filtered_static_points = filter_static_points(frame_detections)
+            cached_frames.append(filtered_static_points)
 
     return cached_frames
 
-# --- Evaluation Logic ---
-def evaluate_filter_performance(all_frames_data, purge_threshold):
+def pre_calculate_clusters(cached_data):
     """
-    Evaluates how well the filter cleans up the Fixed Clusters.
-    Metric: F1 Score of keeping REAL points vs removing GHOST points.
+    Run the heavy DBSCAN once using the fixed parameters.
+    Returns a list of cluster lists.
     """
-    tp = 0 # Real kept
-    fp = 0 # Ghost kept (Bad)
-    tn = 0 # Ghost removed (Good)
-    fn = 0 # Real removed (Bad)
-
-    for frame_detections in all_frames_data:
-        
-        # 1. Run Fixed Clustering (Step 1)
-        raw_clusters, _ = cluster_detections_anisotropic(
+    print("--- Phase 2: Pre-calculating Raw Clusters ---")
+    all_raw_clusters = []
+    
+    for frame_detections in tqdm(cached_data, desc="Clustering"):
+        clusters, _ = cluster_detections_6d(
             frame_detections,
             eps=FIXED_CLUSTERING_PARAMS['eps'],
             min_samples=FIXED_CLUSTERING_PARAMS['min_samples'],
-            weight_vz=FIXED_CLUSTERING_PARAMS['weight_vz'],
-            weight_vxy=FIXED_CLUSTERING_PARAMS['weight_vxy']
+            velocity_weight=FIXED_CLUSTERING_PARAMS['velocity_weight']
+        )
+        all_raw_clusters.append(clusters)
+        
+    return all_raw_clusters
+
+# --- Evaluation Logic (Worker) ---
+def evaluate_filter_performance(all_raw_clusters, thresh_x, thresh_y, thresh_z):
+    """
+    Applies the filter and calculates F1 Score based on 
+    Signal Retention (Recall) vs Noise Rejection (Precision).
+    """
+    tp = 0 # Real kept
+    fp = 0 # Ghost kept
+    tn = 0 # Ghost removed
+    fn = 0 # Real removed (Over-filtering)
+
+    # Prepare tuple for the new filter function
+    keep_ratio = (thresh_x, thresh_y, thresh_z)
+
+    for raw_clusters_frame in all_raw_clusters:
+        
+        # This function is now very fast (just checking absolute differences)
+        refined_clusters, purge_noise = filter_clusters_mad(
+            raw_clusters_frame,
+            std_threshold=keep_ratio
         )
         
-        # 2. Run Filtering (Step 2 - The variable being optimized)
-        refined_clusters, purge_noise = filter_clusters_median(
-            raw_clusters,
-            purge_threshold=purge_threshold
-        )
-        
-        # 3. Calculate Stats
-        
-        # Check what was KEPT (Inside refined_clusters)
+        # 1. Analyze what we KEPT (refined_clusters)
         for cluster in refined_clusters:
             for det in cluster:
-                noise_type = det[3] # Index 3 is noise_type
-                if noise_type == NoiseType.REAL:
-                    tp += 1
-                else:
-                    # Kept a Multipath/Noise point -> False Positive
-                    fp += 1
+                # only care about non-static objects
+                if det[7] > 0:
+                    # det[3] is NoiseType (1=REAL, 0=NOISE)
+                    if det[3] == NoiseType.REAL:
+                        tp += 1
+                    else:
+                        fp += 1
                     
-        # Check what was REMOVED (Inside purge_noise)
+        # 2. Analyze what we REMOVED (purge_noise)
         for det in purge_noise:
-            noise_type = det[3]
-            if noise_type == NoiseType.REAL:
-                # Removed a Real point -> False Negative (Over-filtering)
-                fn += 1
-            else:
-                # Removed a Noise point -> True Negative (Successful Purge)
-                tn += 1
+            # only care about non-static objects
+            if det[7] > 0:
+                if det[3] == NoiseType.REAL:
+                    fn += 1 # Bad: We threw away a real point
+                else:
+                    tn += 1 # Good: We threw away noise
 
-    # --- Calculate F1 ---
+    # --- Calculate Score ---
+    # Precision: Out of everything we kept, how much is real?
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    
+    # Recall: Out of all real points provided, how many did we keep?
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     
     if (precision + recall) > 0:
@@ -141,41 +167,76 @@ def evaluate_filter_performance(all_frames_data, purge_threshold):
         
     return f1, precision, recall, tn
 
+def process_wrapper(params):
+    """Unpacks params and runs evaluation using global data."""
+    global _worker_raw_clusters
+    
+    f1, prec, rec, ghosts = evaluate_filter_performance(
+        _worker_raw_clusters, 
+        params['x'], 
+        params['y'], 
+        params['z']
+    )
+    return f1, prec, rec, ghosts, params
+
 # --- Main Execution ---
 if __name__ == "__main__":
     
-    # Load Data
+    # 1. Load Data
     cached_data = cache_simulation_data(max_frames_to_load=None)
     if not cached_data:
         print("No data.")
         sys.exit(1)
         
-    print(f"\n--- Phase 2: Optimizing Filter (Threshold Search) ---")
-    print(f"Fixed Clustering Params: {FIXED_CLUSTERING_PARAMS}")
+    # 2. Pre-Calculate Clusters (The Optimization)
+    # We do this here so we don't have to re-run DBSCAN 200 times.
+    raw_clusters_data = pre_calculate_clusters(cached_data)
+
+    # 3. Generate Search Grid
+    keys, values = zip(*PARAM_GRID.items())
+    # combinations will look like: [{'x': 1.0, 'y': 3.0, 'z': 0.5}, ...]
+    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    print(f"\n--- Phase 3: Grid Search ({len(param_combinations)} combinations) ---")
     
     best_score = -1.0
-    best_thresh = None
-    best_stats = (0, 0, 0) # Prec, Rec, GhostsKilled
+    best_params = None
+    best_stats = None
 
-    for thresh in tqdm(PARAM_GRID['purge_threshold'], desc="Sweeping Thresholds"):
+    # 4. Run Parallel Processing
+    max_workers = os.cpu_count()
+    
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=init_worker,
+        initargs=(raw_clusters_data,) # Pass the clusters, not the raw frames
+    ) as executor:
         
-        f1, prec, rec, ghosts_killed = evaluate_filter_performance(cached_data, thresh)
-        
-        # Verbose print to see trade-offs
-        # print(f"Thresh {thresh}: F1={f1:.3f} | Prec={prec:.3f} | Rec={rec:.3f} | Ghosts Killed={ghosts_killed}")
-        
+        results = list(tqdm(
+            executor.map(process_wrapper, param_combinations), 
+            total=len(param_combinations), 
+            desc="Optimizing Thresholds"
+        ))
+
+    # 5. Find Best Result
+    for f1, prec, rec, ghosts, params in results:
         if f1 > best_score:
             best_score = f1
-            best_thresh = thresh
-            best_stats = (prec, rec, ghosts_killed)
+            best_params = params
+            best_stats = (prec, rec, ghosts)
+            # Optional: Print new high scores as they are found
+            # print(f"New Best: {f1:.3f} | Params: {params}")
 
     print("\n" + "="*40)
     print("FILTER OPTIMIZATION RESULTS")
     print("="*40)
     print(f"Best F1 Score: {best_score*100:.2f}%")
-    print(f"  - Precision: {best_stats[0]*100:.2f}% (Purity)")
-    print(f"  - Recall:    {best_stats[1]*100:.2f}% (Retention)")
-    print(f"  - Total Ghosts Removed: {best_stats[2]}")
+    print(f"  - Precision (Purity):    {best_stats[0]*100:.2f}%")
+    print(f"  - Recall (Retention):    {best_stats[1]*100:.2f}%")
+    print(f"  - Total Ghosts Removed:  {best_stats[2]}")
     print("-" * 20)
-    print(f"Optimal Purge Threshold: {best_thresh} m/s")
+    print("Optimal Thresholds:")
+    print(f"  X (Lateral):      {best_params['x']} m/s")
+    print(f"  Y (Longitudinal): {best_params['y']} m/s")
+    print(f"  Z (Vertical):     {best_params['z']} m/s")
     print("="*40)

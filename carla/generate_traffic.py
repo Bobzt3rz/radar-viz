@@ -251,6 +251,13 @@ def main():
                 print(response.actor_id)
                 vehicles_list.append(response.actor_id)
 
+        # --- CHANGE 2: Force all spawned vehicles to ignore lights ---
+        # We need to get the actual actor objects to configure per-vehicle settings
+        all_vehicle_actors = world.get_actors(vehicles_list)
+        for actor in all_vehicle_actors:
+            # 100% chance to ignore traffic lights
+            traffic_manager.ignore_lights_percentage(actor, 100.0) 
+
         # Set automatic vehicle lights update if specified
         if args.car_lights_on:
             all_vehicle_actors = world.get_actors(vehicles_list)

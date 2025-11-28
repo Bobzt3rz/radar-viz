@@ -358,3 +358,35 @@ def calculate_corrected_angle_error(
     weighted_error = angle * (norm_obs * np.linalg.norm(vel_cam_A))
     
     return weighted_error
+
+def calculate_rigid_3d_velocities(clusters: List[List[DetectionTuple]]) -> List[List[DetectionTuple]]:
+    refined_clusters = []
+
+    for cluster in clusters:
+        points: List[DetectionTuple] = []
+        for det in cluster:
+            pos_point = det[4]        # p: Position of the point
+            vel_point = det[5]        # v_point: Measured 3D velocity of the point
+            omega_gt = det[11]        # omega: GT Angular velocity
+            center_gt = det[12]       # c: GT Center of object
+            
+            # 1. Calculate the lever arm (vector from Center to Point)
+            # r = p - c
+            r_vec = pos_point - center_gt
+            
+            # 2. Calculate the tangential velocity component caused by rotation
+            # v_tan = omega x r
+            v_tangential = np.cross(omega_gt, r_vec)
+            
+            # 3. Calculate the translational velocity of the object (The Vote)
+            # v_obj = v_point - v_tan
+            v_obj_vote = vel_point - v_tangential
+
+            # shouldn't really mutate it like this, but leave it like this for now
+            det[14][:] = v_obj_vote
+            
+            points.append(det)
+        
+        refined_clusters.append(points)
+
+    return refined_clusters
